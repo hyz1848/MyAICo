@@ -16,15 +16,10 @@ const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-const REPO = process.argv[2] || 'hyz1848/MyAICo';
-const BRANCH = process.argv[3] || 'main';
+const REPO_DEFAULT = process.argv[2] || 'hyz1848/MyAICo';
+const BRANCH_DEFAULT = process.argv[3] || 'main';
 const TOKEN = process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
 const API = 'https://api.github.com';
-
-if (!TOKEN) {
-  console.error('缺少 GH_TOKEN 环境变量（GitHub PAT）');
-  process.exit(2);
-}
 
 const git = (...args) => execFileSync('git', args, { cwd: __dirname, encoding: 'buffer' }).toString('utf8').trim();
 
@@ -55,7 +50,9 @@ function isBinary(buf) {
   return false;
 }
 
-(async () => {
+async function pushViaApi(TOKEN, opts = {}) {
+  const REPO = opts.repo || REPO_DEFAULT;
+  const BRANCH = opts.branch || BRANCH_DEFAULT;
   const headMessage = git('log', '-1', '--format=%B');
   const authorName = git('log', '-1', '--format=%an');
   const authorEmail = git('log', '-1', '--format=%ae');
@@ -144,7 +141,18 @@ function isBinary(buf) {
   fs.writeFileSync(refFile, commitSha + '\n');
   console.log(`已写入本地跟踪引用 .git/refs/remotes/origin/${BRANCH} → ${commitSha.slice(0, 8)}`);
   console.log(`\n下一步（本地对齐，无需网络）：\n  git reset --mixed ${commitSha}\n  git branch --set-upstream-to=origin/${BRANCH} ${BRANCH}`);
-})().catch((e) => {
-  console.error('失败:', e.message);
-  process.exit(1);
-});
+  return { commitSha, treeSha, treeMatches };
+}
+
+if (require.main === module) {
+  if (!TOKEN) {
+    console.error('缺少 GH_TOKEN 环境变量（GitHub PAT）');
+    process.exit(2);
+  }
+  pushViaApi(TOKEN, { repo: REPO_DEFAULT, branch: BRANCH_DEFAULT }).catch((e) => {
+    console.error('失败:', e.message);
+    process.exit(1);
+  });
+}
+
+module.exports = { pushViaApi, API };
