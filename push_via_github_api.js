@@ -20,6 +20,8 @@ const REPO_DEFAULT = process.argv[2] || 'hyz1848/MyAICo';
 const BRANCH_DEFAULT = process.argv[3] || 'main';
 const TOKEN = process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
 const API = 'https://api.github.com';
+// 实际用于请求的 token：pushViaApi() 被调用时会覆盖（支持从凭据管理器传入）
+let activeToken = TOKEN;
 
 const git = (...args) => execFileSync('git', args, { cwd: __dirname, encoding: 'buffer' }).toString('utf8').trim();
 
@@ -27,7 +29,7 @@ async function api(method, url, body) {
   const res = await fetch(`${API}${url}`, {
     method,
     headers: {
-      Authorization: `token ${TOKEN}`,
+      Authorization: `token ${activeToken || TOKEN}`,
       Accept: 'application/vnd.github+json',
       'User-Agent': 'voiceai-push',
       ...(body ? { 'Content-Type': 'application/json' } : {}),
@@ -50,7 +52,8 @@ function isBinary(buf) {
   return false;
 }
 
-async function pushViaApi(TOKEN, opts = {}) {
+async function pushViaApi(token, opts = {}) {
+  activeToken = token;
   const REPO = opts.repo || REPO_DEFAULT;
   const BRANCH = opts.branch || BRANCH_DEFAULT;
   const headMessage = git('log', '-1', '--format=%B');
