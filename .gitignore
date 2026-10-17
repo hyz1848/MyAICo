@@ -1,0 +1,27 @@
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 依赖与虚拟环境
+node_modules/
+venv/
+
+# 运行期数据（会话历史、提醒）
+data/
+
+# 日志
+logs/
+
+# 模型权重（体积大，按需下载）
+models/*.tar.bz2
+models/kokoro-*/
+models/vits-*/
+
+# 临时音频与审计文件
+temp/
+
+# 含密钥的配置（保留 example 供他人参考）
+config/tools.json
+
+# 本地覆盖配置（如需保留个人密钥，请把 conf.json 改成 conf.local.json 再引用）
+conf.local.json
