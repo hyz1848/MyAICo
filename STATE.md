@@ -28,6 +28,18 @@ tar -xjf piper-zh.tar.bz2
 ```
 镜像/代理均不通（hf-mirror 超时、ghproxy/gh-proxy/ghfast 0B/s、modelscope 404、无 aria2c）→ 只能 GitHub 直连。
 
+## 代码管理（GitHub）
+- 仓库：**https://github.com/hyz1848/MyAICo**（分支 `main`）
+- 本地配置：`user.name/email = hyz1848 / hyz1840@163.com`；`credential.helper=manager`（凭据存 Windows 凭据管理器）
+- 入库范围：源码/配置/测试/文档共 **58 文件 ~570K**；**排除** `venv/ models/ logs/ data/ temp/ node_modules/` 与 `config/tools.json`（含密钥，仓库里只放 `config/tools.example.json` 模板）
+- ⚠️ 本机 **`github.com:443` 不可达**（`api.github.com` 正常）→ `git push` 会卡在连接超时。
+  用 `push_via_github_api.js` 走 **REST API** 推送（`GH_TOKEN=<PAT> node push_via_github_api.js`）：
+  它把本地 HEAD 的内容原样建成远端 tree/commit/ref，**用同一 tree 哈希校验内容逐字节一致**；
+  空仓库阶段 GitHub 禁用 Git Data API（409 "Git Repository is empty"），脚本会先用 Contents API 造首个提交。
+- 目前本地与远端的提交 SHA 不同源（本地无法 fetch 远端对象），但**内容完全一致**（tree 哈希相同已验证）。
+  `github.com` 可达时一条命令对齐：`git fetch origin && git reset --mixed origin/main`
+- 远端历史：`初始化仓库` → `VoiceAI 首版` → `增加 API 推送工具`
+
 ## 项目
 个人 AI 语音助理，C/S 架构。浏览器纯显示（无框架原生 JS），Node 服务，Python worker 干语音重活。
 目录 `H:/voiceai/`，端口 **8214**，启动 `node server.js`（自动拉起 worker）。
