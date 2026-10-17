@@ -24,6 +24,14 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
+# 子进程经管道与 worker 通信：Windows 下默认 stdout 编码可能不是 UTF-8，
+# 写 JSON 时直接抛 OSError [Errno 22]（实测）→ 显式改 UTF-8。
+for _s in (sys.stdin, sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
 # 注意：**不要**乱设 MIOPEN_* 环境变量。我曾设 MIOPEN_FIND_MODE/ENFORCE 试图避免
 # 运行时算法搜索，结果 MIOpen 解析失败报 "invalid stoul argument"（用户环境不设它们时反而正常）。
 # 真正需要的只是"别让模型去请求 dropout 内核"——见下面配置级 dropout 归零。
@@ -36,6 +44,21 @@ MODEL_DIR = os.path.join(HERE, 'models', 'kokoro-torch')
 ONNX_DIR = os.path.join(HERE, 'models', 'kokoro-int8-multi-lang-v1_1')
 STYLES_PER_VOICE = 510
 DEFAULT_VOICE = 'zf_001'
+
+
+def setup_miopen_cache():
+    """MIOpen 的算法搜索是**按卷积形状**做的：句子长度一变就是新形状 → 重新搜索（实测每句 10~15s ✗）。
+    给它一个可写的持久化 DB 目录，搜索结果会落盘复用（第二次遇到同形状就是查表 ✓）。
+    注意：只设路径类变量；不要设 MIOPEN_FIND_MODE/ENFORCE 这类"模式"变量
+    （实测会触发 MIOpen 解析错误 invalid stoul argument ✗）。"""
+    cache = os.path.join(HERE, 'data', 'miopen')
+    try:
+        os.makedirs(cache, exist_ok=True)
+        os.environ.setdefault('MIOPEN_USER_DB_PATH', cache)
+        os.environ.setdefault('MIOPEN_CUSTOM_CACHE_DIR', cache)
+        return cache
+    except Exception:
+        return None
 
 
 def stub_misaki():
@@ -75,6 +98,9 @@ def stub_misaki():
         sys.modules[name] = m
     sys.modules['misaki'].en = sys.modules['misaki.en']
     sys.modules['misaki'].espeak = sys.modules['misaki.espeak']
+
+
+setup_miopen_cache()          # 须在模型加载（懒 import torch）之前调用
 
 
 class KokoroGpu:
@@ -143,7 +169,12 @@ class KokoroGpu:
             if not os.path.exists(p):
                 raise RuntimeError('音色文件不存在: %s' % p)
             # 形状是 [510, 1, 256]，取 [idx] 得 [1,256] —— 官方就是直接传，不要再 unsqueeze
-            self.voices[name] = self.torch.load(p, map_location='cpu')
+            # torch>=2.6 默认 weights_only=True，部分音色文件含非张量对象会反序列化失败 ✗
+            # （实测报 WeightsUnpickler "Unsupported operand"）→ 显式关闭（文件来自官方镜像，可信）
+            try:
+                self.voices[name] = self.torch.load(p, map_location='cpu', weights_only=False)
+            except TypeError:
+                self.voices[name] = self.torch.load(p, map_location='cpu')
         return self.voices[name]
 
     def _run(self, ids, ref, speed):
@@ -197,7 +228,12 @@ def serve():
     warm_s = 0.0
     try:
         t0 = time.time()
-        eng.synth('你好', os.path.join(HERE, 'temp', '_warm.wav'))
+        # 按几种典型长度各预热一次：MIOpen 搜索是按卷积形状的，覆盖常见长度后
+        # 用户实际句子的形状大多命中（首次仍可能略慢，之后落盘复用 ✓）
+        for t in ('你好', '你好，我是潞潞同学。',
+                  '这是一句用来覆盖中等长度卷积形状的预热文本，大约三十来个字。',
+                  '这句更长一些，用来把更大形状的卷积也预热掉，避免用户第一次说长句时等待过久。' * 2):
+            eng.synth(t, os.path.join(HERE, 'temp', '_warm.wav'))
         warm_s = time.time() - t0
     except Exception as e:
         print(json.dumps({'warm_error': '%s: %s' % (type(e).__name__, e)}), flush=True)

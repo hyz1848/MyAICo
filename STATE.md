@@ -1,4 +1,126 @@
+# VoiceAI 状态快照（2026-10-17 晚 更新）
+
+## ✅ 本轮修掉的声音问题（4 个真 bug，全部有日志证据）
+用户报障链：听不到声音 → 声音呆板 → 唤醒后时有气泡但无声音。根因**四个叠加**：
+
+| # | 问题 | 证据 | 修法 |
+|---|---|---|---|
+| 1 | 服务端放音**沿用采集的 16kHz** ✗（TTS 全被降到电话音质；MME/HDMI 等端点直接静音） | 日志 `服务端放音已启动（16000Hz）` | 输出改用**设备原生率** ✓（新增 `tts.outputRate`，0=自动） |
+| 2 | 默认输出走 **MME 的 #3** ✗（老 API） | `默认 hostapi: MME / 默认输出设备索引: 3` | 新增 `tts.outputDevice` ✓（纯数字=索引 ✓，其它=名字子串 ✓）；本机设为 `9`（34G6K-PRO DirectSound 44100 ✓，用户实测出声） |
+| 3 | 配置里 `"9"` 被 sounddevice 当**名字子串** ✗ → 撞上 `MU900` 里的 9 → 匹配 4 个设备报错 → 回退浏览器 | `服务端放音入队失败: Multiple output devices found for '9': [5] 扬声器(MU900)...` | 纯数字**按索引**解析 ✓ |
+| 4 | 回退路径静默：`played=browser` 时若浏览器没开/静音就彻底无声 | `played=browser`（文字输入也走这条 ✗） | 保留 `_player` 常驻 ✓（main() 里创建 ✓）+ AEC 参考与输出率**解耦** ✓（参考固定 16k ✓ 按播放位置成比例取片 ✓ 零漂移 ✓） |
+
+**AEC 参考解耦**（关键设计）：`Player(sr=设备原生率, aec_rate=16000)` ✓
+—— 输出 44.1/48k 保音质 ✓，AEC 参考仍是麦克风的 16k ✓（环形缓冲按样本计数对齐 ✓），
+回调里用 `int(pos*aec_rate/sr)` 取片 ✓ → 无额外状态、无漂移 ✓。
+
+### 本机音频端点速查
+| 索引 | 名称 | HostAPI | 原生率 | 备注 |
+|---|---|---|---|---|
+| 2 | Microsoft 声音映射器 | MME | 44100 | |
+| **3** | 34G6K-PRO | **MME** | 44100 | **系统默认** ✗（曾静音） |
+| **9** | 34G6K-PRO for Display | **DirectSound** | 44100 | **当前使用 ✓ 用户实测出声** |
+| 12 | 34G6K-PRO for Display | WASAPI | 48000 | 同端点最现代 ✓ 未验证 |
+| 14 | 扬声器 (MU900) | WASAPI | 48000 | 麦克风同款设备 ✓ |
+| 16 | 34G6K-PRO ACX HD Audio Speaker | WDM-KS | 44100 | |
+
+MIOpen/音频之外，**同一物理端点会被列 3~4 次**（MME/DirectSound/WASAPI/WDM-KS ✓），
+只有部分 API 组合能出声 ✓ → 所以 `outputDevice` 按**索引**指定最可靠 ✓。
+
+## ✅ Kokoro 音色文件真相（已修）
+- 症状：102 个 `voices/*.pt` 里 **98 个是 348 字节 HTML** ✗ → 所以"只有 zf_001/zf_002/zm_010 能用" ✗
+- 根因：最初用 **hf/hub 下载时没跟随 LFS 重定向** ✗ → 把跳转页存成了 `.pt` ✓（文件内容就是 `<a href="https://cdn-lfs-cn-1.modelscope.cn/...">Found</a>`）
+- 正确通道：**ModelScope `AI-ModelScope/Kokoro-82M-v1.1-zh`** ✓（就是 worker 下 ASR 模型那条已验证通道 ✓）
+  `https://www.modelscope.cn/models/AI-ModelScope/Kokoro-82M-v1.1-zh/resolve/master/voices/<name>.pt`
+  → **9 秒下完 50MB** ✓ 现为 **女声 55 + 男声 44 = 100 个可用中文音色** ✓（+af_maple 等英文 ✓）
+- 校验方法（必须做 ✓）：`torch.load(f, map_location='cpu', weights_only=False)` 成功且 shape==(510,1,256) ✓
+
+### Kokoro 接入方式（已接通 ✓ 实测 RTF 0.25 ✓）
+- `tts.kokoroSidecarPython` / `tts.kokoroSidecarPath` ✓（默认主 venv + `kokoro-deps` ✓）
+- sidecar 设备**自选** ✓（主 venv 的 cpu torch → cpu ✓；venv-gpu → gpu ✓），非结果行（启动 warn/ready）要**跳过** ✓
+
+**教训（别重犯）**：后台任务必须用**会回执的机制** ✓，并且"启动成功"≠"下载成功" ✓ —— 必须校验**文件内容**（大小/头部/torch.load ✓）✗。
+
+## Kokoro（中英双语）在 GPU 上的真实表现与结论
+**我之前的结论错了** ✗：我说"GPU 比 CPU 慢（RTF 1.5）"——那是把**冷启动**算进去了 ✗
+（MIOpen 首次算法搜索 + 内核加载 ✓）。用 `torch.profiler` 分算子量出来的**热态**是：
+
+| 路径 | RTF（热态） | 说明 |
+|---|---|---|
+| **Piper + DirectML**（默认） | **0.02~0.09** ✓✓ | 220~520ms/句 |
+| **Kokoro + ROCm GPU** | **0.161** ✓（1081ms / 6.72s 音频） | 比 CPU 快约 6 倍 ✓，显存 613MB |
+| Kokoro + CPU/ONNX | 0.91~1.06 | 慢 |
+profiler 显示瓶颈在 `aten::miopen_convolution`（607ms / 1045ms CUDA ✓，88 次卷积每次 ~7ms，
+走的还是通用 `GemmFwdRest` ✗）—— 官方 `rocm/pytorch` 镜像的 MIOpen 内核库更全，能更快 ✓。
+
+**参考实现（用户提供的三个项目）都印证同一做法**：
+- `sizeak/kokoro-tts-rocm`：`KModel(repo_id=...).to('cuda').eval()` + `KPipeline` ✓ 无特殊设置 ✓
+- `moritzchow/Kokoro-FastAPI-ROCm`：只加了 Docker（`FROM rocm/pytorch:latest` ✓），**Python 一行没改** ✓
+- smeltcore 配方：唯一 AMD 专属步骤就是装 ROCm 版 torch ✓；强调**原生 BF16/FP16** ✓；
+  而且他们**不给具体基准** ✗（只说 RTF < 1 ✓）→ 与实测 0.16 相称 ✓
+
+**结论**：Kokoro 在 GPU 上**可用** ✓（RTF 0.16、本地、双语），但仍慢于 Piper 5 倍左右 ✗
+→ 默认仍 Piper ✓；要用 Kokoro 只需 `tts.backend=kokoro`（GPU 路径默认开 ✓）。
+
+**冷启动成本**：sidecar 启动时**热身**（约 8s，MIOpen 搜索一次 ✓）→ 用户第一句不被它拖累 ✓。
+
+**这一轮修掉的坑（都在代码里注释了）**：
+1. `KModel.forward()` 收的是**音素字符串** ✗ → 必须用 `forward_with_tokens(torch.LongTensor([[0,*ids,0]]), ref, speed)`（**首尾补 0** ✓）
+2. 配置里 `plbert.dropout=0.1`（ALBERT 注意力在 C++ 层调 dropout ✓）→ **构造前**把 config 的 dropout 置 0 ✓
+3. **不要乱设 `MIOPEN_*` 环境变量** ✗（我设了 `MIOPEN_FIND_MODE/ENFORCE` → MIOpen 解析失败
+   `invalid stoul argument` ✗✓；去掉就好 —— 用户 OCR 环境不设它们，一直正常 ✓）
+4. sidecar 经管道通信要**显式 UTF-8**（`sys.stdout.reconfigure` + `PYTHONIOENCODING=utf-8` ✓）
+
 # VoiceAI 状态快照（2026-10-17 更新）
+
+## ⏳ 进行中：TTS 音色与 Kokoro 各运行时（续做点）
+**用户诉求**：① Kokoro 默认音色 `zf_001` 不好听 → 要挑音色；② 想知道 Kokoro 在本机能到多少速度；
+③ 提到**另有一台机器带 Intel Arc 140T（12GB）**可以试试。
+
+### 实测速度总表（本机，均为真测）
+| Kokoro 路径 | 稳态 | RTF | 说明 |
+|---|---|---|---|
+| ROCm GPU（长度命中缓存） | **0.93s** / 6.2s 音频 | **0.15** ✓ | profiler 亦 937ms/6.72s（0.139）✓ |
+| ROCm GPU（**新句子长度**首次） | 8~20s | 1.2~3.2 ✗ | JIT 编译内核；**Windows 的 MIOpen 无预编译内核库** ✗（Linux 镜像才有 ✓）；`MIOPEN_FIND_MODE=2` 可快一倍 ✓ |
+| CPU（ONNX int8，`tts_kokoro.py`） | 2.5~5.6s | 0.91~1.06 | 稳定可用 ✓ |
+| CPU（PyTorch + **ROCm 版** torch） | 22~61s | 3.8~16.5 ✗ | AMD wheel 的 CPU 路径无 MKL ✗ 不可用 |
+| **CPU（PyTorch + cpu 版 torch）** | **1.2~1.7s**（2.85~6.3s 音频） | **0.25~0.60** ✓✓ | **本机最好的 Kokoro 路径** ✓（比 ONNX 快 4 倍 ✓ 且无 JIT 意外 ✓） |
+| **Piper + DirectML（默认）** | 220~520ms | **0.02~0.09** ✓✓ | 本机最快，不碰 MIOpen ✓ |
+
+### 「本机 Kokoro 能到多少」结论
+1. **Piper + DirectML：RTF 0.02~0.09** ✓✓（整体最快，默认）
+2. **Kokoro + cpu 版 torch（本机最佳 Kokoro）：RTF 0.25~0.60** ✓✓ 1.2~1.7s/句，中英双语 ✓
+3. Kokoro + ROCm GPU：缓存命中时 0.15 ✓ 但新句子长度要 ~8s ✗（不可预测）
+4. Kokoro + ONNX int8：0.9~1.06 ✗
+→ 若要用 Kokoro，**走第 2 条**（`venv/Scripts/python.exe` + `PYTHONPATH=kokoro-deps` + `device=cpu`）✓
+
+### 隔离方案（不污染主 venv）
+- `kokoro-deps/`（78MB+）：kokoro/loguru/transformers/tokenizers 0.22.2/scipy 1.18 等
+  → 用 `PYTHONPATH=H:/voiceai/kokoro-deps venv/Scripts/python.exe ...` 注入 ✓
+  （主 venv 的 `tokenizers 0.23.3` 与 transformers 5.15 要求的 ≤0.23.0 冲突 ✗；
+   主 venv 的 **scipy 是坏的**（`_ccallback_c` ✗）→ 已从 OCR venv 拷一份进 kokoro-deps ✓）
+- `venv-gpu/`（约 6GB）：ROCm torch + ROCm 运行时 + kokoro → 只用于"GPU Kokoro 实验"
+- `setup_gpu_venv.py`：可复现地重建 venv-gpu ✓
+
+### 音色
+- **Kokoro 有 99 个中文音色** ✓（`models/kokoro-torch/voices/`：55 个 `zf_*` 女声 + 44 个 `zm_*` 男声 ✓）
+  + 3 个英文（af_maple/af_sol/bf_vale ✓）；切换：`tts.kokoroVoiceName`（如 `zf_017`）
+- 试听素材在 `temp/voices/` ✓（9 个 edge-tts 中文音色 ✓ + Kokoro 若干 ✓）→ **试听页 `temp/voices/index.html` 还没做**（续做点 ✓）
+- **edge-tts 的中文音色质量最好** ✓（`tts.backend=edge` + `tts.voice=zh-CN-XiaoxiaoNeural|XiaoyiNeural|YunxiNeural|liaoning-XiaobeiNeural|shaanxi-XiaoniNeural` 等 ✓）
+- Kokoro 批量生成的两个坑：`torch.load(..., weights_only=False)` ✓（torch≥2.6 默认 True ✗ 会让部分 `voices/*.pt` 反序列化失败 ✓）；批量脚本读 stdout 时**首行是 `ready`** ✗（会把计数错位 ✗）
+
+### 续做点（优先级）
+1. ~~把「Kokoro-CPU（cpu 版 torch）」接进 sidecar~~ **已接通 ✓**：`tts.kokoroSidecarPython`（默认主 venv）
+   + `tts.kokoroSidecarPath`（= kokoro-deps）→ 实测 **RTF 0.25**（1.2s/句 ✓ 已验证 ✓）
+2. **做试听页 `temp/voices/index.html`**（9 个 edge + Kokoro 若干已在 `temp/voices/` ✓）+ 让用户挑音色
+3. 音色落地：`tts.backend=edge`+`tts.voice=<更好的 edge 音色>` 或 `tts.backend=kokoro`+`tts.kokoroVoiceName=zf_017…`
+4. Intel Arc 140T 远程 TTS（见下）
+
+### Intel Arc 140T（另一台机器）计划（未开始 ✓）
+- 麦克风/音箱在**本机** → 那台只能做**远程 TTS 服务**（HTTP ✓，与 edge-tts 同形态 ✓）
+- 两条路：① **DirectML** ✓（现有 Piper 代码原样可用 ✓ 改 `tts.remoteUrl` 即可）；② **OpenVINO** ✓（Intel 自家栈，对 Arc 支持最好 ✓）
+- 需要新增：worker 的 `remote` TTS 后端（HTTP POST → WAV ✓）+ 那台机器上的一键服务脚本 ✓
+
 
 ## ✅ 已完成：本地 TTS（默认 piper + DirectML，比 edge 快 ~10 倍）
 本机 **AMD Radeon RX 9070 XT**（无 NVIDIA）走 **DirectML**，跑 Piper(VITS) int8：
@@ -249,7 +371,8 @@ LLM 默认 `http://192.168.3.166:1234`（`LLM_BASE_URL`/`LLM_MODEL` 可覆盖）
 | **Piper + DirectML（默认）** | **0.02~0.09** ✓✓ | 220~520ms/句 |
 | Kokoro + CPU/ONNX | 0.91~1.06 | 中英双语，可用但偏慢 |
 | Kokoro + ROCm GPU | **1.506** ✗ | 更慢：MIOpen 对该模型只走通用 GEMM 兜底（日志 `GemmFwdRest` workspace 警告） |
-`tts.kokoroUseGpu=true` 才走 GPU sidecar（需 venv-gpu，约 6GB）。
+走**常驻 sidecar** ✓（默认主 venv 的 cpu 版 torch ✓ 实测 RTF 0.25 ✓，比 ONNX 路径快 4 倍 ✓）；
+要用 GPU 就把 `tts.kokoroSidecarPython` 指向 `venv-gpu/Scripts/python.exe` ✓（本机 Windows 上反而更慢 ✗ 见上表）。
 
 **这一轮修掉的三个真 bug（都记下来）**：
 1. **我误设 `MIOPEN_FIND_MODE`/`MIOPEN_FIND_ENFORCE`** → MIOpen 解析失败报 `invalid stoul argument` ✗；

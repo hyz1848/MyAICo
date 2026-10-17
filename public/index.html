@@ -30,12 +30,13 @@
         <h3>设置</h3>
         <div class="setting-item">
           <label>TTS 语音</label>
-          <select id="ttsVoice">
-            <option value="zh-CN-XiaoxiaoNeural">晓晓 (女声)</option>
-            <option value="zh-CN-YunxiNeural">云希 (男声)</option>
-            <option value="zh-CN-YunyangNeural">云扬 (男声-新闻)</option>
-            <option value="zh-CN-XiaoyiNeural">晓伊 (女声-活泼)</option>
-          </select>
+          <div style="display:flex;gap:8px;align-items:center">
+            <select id="ttsVoice" style="flex:1"><option value="">加载中…</option></select>
+            <button class="btn-icon" id="previewVoice" title="试听当前音色">▶</button>
+          </div>
+          <div class="hint" style="font-size:12px;opacity:.65;margin-top:6px">
+            Kokoro 100 个本地音色 + edge-tts 微软音色；选好按「保存」即生效（不用重启）
+          </div>
         </div>
         <div class="setting-item">
           <label>麦克风来源</label>

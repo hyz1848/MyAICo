@@ -569,6 +569,46 @@ registerProcessor('pcm-capture', PcmCapture);
     if (e.target === settingsPanel) settingsPanel.classList.remove('open');
   });
 
+  // ===== 音色列表（Kokoro 100 个 + edge）+ 试听 =====
+  let voiceSamples = {};
+  const isKokoroVoice = (v) => /^(z[fm]|a[fm]|b[fm])_/i.test(v || '');
+  async function loadVoices() {
+    try {
+      const d = await (await fetch('/api/voices')).json();
+      voiceSamples = d.samples || {};
+      const sel = $('ttsVoice');
+      if (!sel) return;
+      const o = ['<optgroup label="Kokoro · 本地 · ' + (d.kokoro || []).length + ' 个音色">'];
+      for (const v of d.kokoro || []) {
+        o.push('<option value="' + v + '">' + v + (voiceSamples['kokoro:' + v] ? '' : '（无试听样本）') + '</option>');
+      }
+      o.push('</optgroup><optgroup label="edge-tts · 微软 · 需联网">');
+      for (const v of d.edge || []) o.push('<option value="' + v + '">' + v + '</option>');
+      o.push('</optgroup>');
+      sel.innerHTML = o.join('');
+      let want = (d.current && d.current.voice) || '';
+      try {
+        const s = JSON.parse(localStorage.getItem('voiceai_settings') || '{}');
+        if (s.voice) want = s.voice;
+      } catch (e) {}
+      if (want) sel.value = want;
+    } catch (e) {
+      addNotice('音色列表加载失败：' + (e.message || e));
+    }
+  }
+  loadVoices();
+
+  const pvBtn = $('previewVoice');
+  if (pvBtn) pvBtn.addEventListener('click', () => {
+    const v = $('ttsVoice').value;
+    const url = voiceSamples[(isKokoroVoice(v) ? 'kokoro:' : 'edge:') + v];
+    if (!url) { addNotice('这个音色还没有试听样本（Kokoro 已预生成 100 个，edge 只有部分）'); return; }
+    if (window._pvAudio) { try { window._pvAudio.pause(); } catch (e) {} }
+    const a = new Audio(url);
+    window._pvAudio = a;
+    a.play().catch((err) => addNotice('试听播放失败：' + (err.message || err)));
+  });
+
   $('saveSettings').addEventListener('click', () => {
     const voice = $('ttsVoice').value;
     const opts = getMicOptions();

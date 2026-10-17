@@ -146,45 +146,80 @@ if AEC_ENABLED:
               f"delay={conf_int('aec.delaySamples', 0)} 样本 mu={conf_num('aec.mu', 0.4)}",
               file=sys.stderr, flush=True)
     except Exception as _e:
+        _aec = None
         print(f"[aec] 初始化失败，退回无 AEC: {_e}", file=sys.stderr, flush=True)
 
 _player = None
 _aec_report = type('R', (), {})()
 
 
-class Player:
-    """服务端放音（sounddevice 输出流）。回调里把输出样本喂给 AEC 作为参考信号。"""
+def resample(data, sr, target):
+    """线性插值重采样（TTS 多为 22.05k/24k，够用且不依赖 scipy ✗）"""
+    if sr == target or len(data) == 0:
+        return data
+    n = max(1, int(round(len(data) * target / float(sr))))
+    idx = np.linspace(0, len(data) - 1, n, dtype=np.float64)
+    return np.interp(idx, np.arange(len(data), dtype=np.float64), data).astype(np.float32)
 
-    def __init__(self, aec=None, samplerate=SAMPLE_RATE, blocksize=BLOCK_SIZE):
-        self.sr = int(samplerate)
+
+class Player:
+    """服务端放音（sounddevice 输出流）。回调里把输出样本喂给 AEC 作为参考信号。
+
+    输出率**不能**沿用采集的 16kHz ✗：那会让所有 TTS 降到电话音质（发闷），
+    某些端点（MME/HDMI）在 16k 单声道下甚至直接静音 ✗ → 默认用设备原生率。
+    """
+
+    def __init__(self, aec=None, samplerate=None, blocksize=BLOCK_SIZE,
+                 device=None, aec_rate=None):
+        dev = device if device is not None else (conf("tts.outputDevice") or None)
+        if isinstance(dev, str):
+            dev = dev.strip()
+            if not dev:
+                dev = None
+            elif dev.lstrip('+-').isdigit():
+                dev = int(dev)      # 纯数字按索引解析 ✗ 否则 "9" 会被当名字子串，撞上 MU900 里的 9
+        self.device = dev
+        self.aec_rate = int(aec_rate or SAMPLE_RATE)
+        self.sr = int(samplerate or conf_int("tts.outputRate", 0) or self._device_rate())
         self.bs = int(blocksize)
         self.aec = aec
         self._lock = threading.Lock()
-        self._items = deque()          # 待播 [(id, np.float32 一维)]
-        self._cur = None               # [id, arr, pos]
+        self._items = deque()          # 待播 [(id, 输出率数组, 采集率参考数组)]
+        self._cur = None               # [id, out, ref, pos]
         self._stream = None
         self._events = queue.Queue()   # 回调线程投递，交给上报线程发（回调里不能阻塞写 stdout）
         self.playing_id = None
         self.dropped = 0               # 中断丢弃的段数（诊断用）
 
+    def _device_rate(self):
+        try:
+            return int(sd.query_devices(self.device, kind='output')['default_samplerate'])
+        except Exception:
+            return 48000
+
     def _ensure_stream(self):
         if self._stream is None:
             self._stream = sd.OutputStream(samplerate=self.sr, channels=1, dtype="float32",
-                                           blocksize=self.bs, callback=self._callback)
+                                           blocksize=self.bs, device=self.device,
+                                           callback=self._callback)
             self._stream.start()
-            print(f"[tts] 服务端放音已启动（{self.sr}Hz，AEC={'开' if self.aec else '关'}）",
+            try:
+                name = sd.query_devices(self.device, kind='output')['name']
+            except Exception:
+                name = str(self.device)
+            print(f"[tts] 服务端放音已启动（{self.sr}Hz → {name[:38]}，"
+                  f"AEC 参考 {self.aec_rate}Hz，AEC={'开' if self.aec else '关'}）",
                   file=sys.stderr, flush=True)
 
     def enqueue(self, path, item_id=None):
         data, sr = sf.read(path, dtype="float32")
         if data.ndim > 1:
             data = data.mean(axis=1)
-        if sr != self.sr:      # TTS 多为 22.05k/24k，重采样到采集率（线性插值够用，且要与麦克风时间轴一致）
-            n = max(1, int(round(len(data) * self.sr / float(sr))))
-            idx = np.linspace(0, len(data) - 1, n, dtype=np.float64)
-            data = np.interp(idx, np.arange(len(data), dtype=np.float64), data).astype(np.float32)
+        out = resample(data, sr, self.sr)
+        # AEC 参考必须与麦克风同率同时间轴（环形缓冲按样本计数对齐）
+        ref = out if self.sr == self.aec_rate else resample(data, sr, self.aec_rate)
         with self._lock:
-            self._items.append((item_id, data))
+            self._items.append((item_id, out, ref))
         self._ensure_stream()
 
     def stop(self):
@@ -212,28 +247,34 @@ class Player:
     def _callback(self, outdata, frames, time_info, status):
         buf = np.zeros(frames, dtype=np.float32)
         pos = 0
+        refs = []
         with self._lock:
             while pos < frames:
                 if self._cur is None:
                     if not self._items:
                         break
-                    item_id, arr = self._items.popleft()
-                    self._cur = [item_id, arr, 0]
+                    item_id, out, ref = self._items.popleft()
+                    self._cur = [item_id, out, ref, 0]
                     self.playing_id = item_id
-                    self._events.put(("start", item_id, len(arr) / float(self.sr)))
-                item_id, arr, p = self._cur
-                take = min(frames - pos, len(arr) - p)
+                    self._events.put(("start", item_id, len(out) / float(self.sr)))
+                item_id, out, ref, p = self._cur
+                take = min(frames - pos, len(out) - p)
                 if take <= 0:
                     self._events.put(("end", item_id, None))
                     self._cur = None
                     self.playing_id = None
                     continue
-                buf[pos:pos + take] = arr[p:p + take]
-                self._cur[2] = p + take
+                buf[pos:pos + take] = out[p:p + take]
+                # AEC 参考按输出位置成比例取片：与播放严格同时间轴，且天然无漂移
+                r0 = int(p * self.aec_rate / self.sr)
+                r1 = int((p + take) * self.aec_rate / self.sr)
+                if r1 > r0:
+                    refs.append(ref[r0:r1])
+                self._cur[3] = p + take
                 pos += take
         outdata[:, 0] = buf
-        if self.aec is not None:
-            self.aec.add_reference(buf)     # 参考信号 = 真正喂给声卡的样本
+        if self.aec is not None and refs:
+            self.aec.add_reference(refs[0] if len(refs) == 1 else np.concatenate(refs))
 
 
 def push_block(arr):
@@ -391,19 +432,24 @@ def transcribe(audio_data):
 # ========== TTS: 本地(sherpa-onnx/Kokoro) 优先，edge-tts 兜底 ==========
 SYNTH_TIMEOUT = cenv("VOICEAI_TTS_TIMEOUT", "tts.timeoutSec", 15, float)
 SYNTH_RETRIES = cenv("VOICEAI_TTS_RETRIES", "tts.retries", 2, int)
+def _tts_order(backend):
+    """首选后端 + 其余兜底（末端 edge 网络合成）"""
+    return [backend] + [b for b in ("piper", "edge", "sherpa", "kokoro") if b != backend]
+
+
 TTS_BACKEND = cenv("VOICEAI_TTS", "tts.backend", "piper", str).lower()   # piper | kokoro | sherpa | edge
 # 兜底顺序按实测速度/可用性排：首选之后依次 piper → edge → sherpa。
 # sherpa(Kokoro) 在 CPU 上 RTF 1.5（比实时慢、跟不上播放），只作最后手段；
 # edge 是网络合成但要 1.2s/句、质量稳，排在 piper 之后。
-TTS_ORDER = [TTS_BACKEND] + [b for b in ("piper", "edge", "sherpa", "kokoro") if b != TTS_BACKEND]
+TTS_ORDER = _tts_order(TTS_BACKEND)
 _local_tts = None
 _local_fails = 0            # 本地连续失败次数
 _local_disabled = False     # 连续失败达上限后本次进程内不再尝试本地
 _missing_logged = False     # "模型未就绪"只提示一次，避免每句刷屏
 _piper_tts = None
 _kokoro_tts = None
-_kokoro_gpu = None        # 常驻 sidecar 进程（独立 venv-gpu 里的 ROCm torch）
-_kokoro_gpu_lock = None
+_kokoro_sc = None         # 常驻 sidecar 进程（默认主 venv 的 cpu 版 torch）
+_kokoro_sc_lock = None
 _piper_fails = 0
 _piper_disabled = False
 _piper_missing_logged = False
@@ -475,61 +521,88 @@ def synth_kokoro(text, voice=None):
     return path
 
 
-def kokoro_gpu_python():
-    """GPU 版 Kokoro 用的解释器：优先配置，其次项目内 venv-gpu"""
-    p = conf("tts.kokoroGpuPython") or os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                                   "venv-gpu", "Scripts", "python.exe")
-    return p if os.path.exists(p) else None
+def kokoro_sidecar_python():
+    """Kokoro sidecar 用的解释器：优先配置；默认主 venv（cpu 版 torch 实测 RTF 0.25~0.60 ✓），
+    其次 venv-gpu（ROCm torch，GPU 实验用 —— 本机 Windows 上反而更慢 ✗）"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for p in (conf("tts.kokoroSidecarPython"),
+              os.path.join(here, "venv", "Scripts", "python.exe"),
+              os.path.join(here, "venv-gpu", "Scripts", "python.exe")):
+        if p and os.path.exists(p):
+            return p
+    return None
 
 
-def _kokoro_gpu_proc():
-    """懒启动常驻 sidecar（模型只加载一次；每句重载模型会白等 1~2 秒）"""
-    global _kokoro_gpu, _kokoro_gpu_lock
+def _kokoro_sidecar_env():
+    """sidecar 的环境：PYTHONPATH 注入隔离依赖目录（kokoro-deps），
+    免得 Kokoro 的 transformers/tokenizers/scipy 与主 venv 的 funasr 打架 ✗"""
+    env = dict(os.environ)
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    dep = conf("tts.kokoroSidecarPath") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "kokoro-deps")
+    if os.path.isdir(dep):
+        env["PYTHONPATH"] = (dep + os.pathsep + env["PYTHONPATH"]) if env.get("PYTHONPATH") else dep
+    return env
+
+
+def _kokoro_sidecar_proc():
+    """懒启动常驻 sidecar（模型只加载一次；每句重载模型会白等 1~2 秒）。
+    设备由 tts_kokoro_gpu.py 按 torch.cuda.is_available() 自选：
+    主 venv → cpu（快且确定 ✓）；venv-gpu → gpu（本机 Windows 上默认更慢 ✗）"""
+    global _kokoro_sc, _kokoro_sc_lock
     import subprocess
-    if _kokoro_gpu_lock is None:
-        _kokoro_gpu_lock = threading.Lock()
-    with _kokoro_gpu_lock:
-        if _kokoro_gpu is not None and _kokoro_gpu.poll() is None:
-            return _kokoro_gpu
-        py = kokoro_gpu_python()
+    if _kokoro_sc_lock is None:
+        _kokoro_sc_lock = threading.Lock()
+    with _kokoro_sc_lock:
+        if _kokoro_sc is not None and _kokoro_sc.poll() is None:
+            return _kokoro_sc
+        py = kokoro_sidecar_python()
         if not py:
             return None
         script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tts_kokoro_gpu.py")
-        env = dict(os.environ)
+        env = _kokoro_sidecar_env()
         # ROCm 运行时若在外部 SDK 里，补进 PATH（torch 轮子通常自带，缺了才需要）
         rocm_bin = os.path.join(os.environ.get("HIP_PATH", r"D:\Program Files\AMD\ROCm"), "bin")
         if os.path.isdir(rocm_bin) and rocm_bin not in env.get("PATH", ""):
             env["PATH"] = rocm_bin + os.pathsep + env.get("PATH", "")
-        _kokoro_gpu = subprocess.Popen([py, script, "--server"], stdin=subprocess.PIPE,
-                                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                       text=True, encoding="utf-8", bufsize=1, env=env)
-        line = _kokoro_gpu.stdout.readline()      # 等 ready
+        _kokoro_sc = subprocess.Popen([py, script, "--server"], stdin=subprocess.PIPE,
+                                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                      text=True, encoding="utf-8", bufsize=1, env=env)
+        line = _kokoro_sc.stdout.readline()      # 等 ready
         if not line:
-            raise RuntimeError("Kokoro GPU sidecar 启动失败")
-        print(f"[tts] Kokoro-GPU sidecar 就绪: {line.strip()}", file=sys.stderr, flush=True)
-        return _kokoro_gpu
+            raise RuntimeError("Kokoro sidecar 启动失败")
+        print(f"[tts] Kokoro sidecar 就绪: {line.strip()}", file=sys.stderr, flush=True)
+        return _kokoro_sc
 
 
-def synth_kokoro_gpu(text, voice=None):
-    """GPU 合成（独立 venv-gpu 里的 ROCm torch，走常驻 sidecar）"""
+def synth_kokoro_sidecar(text, voice=None):
+    """Kokoro 合成（常驻 sidecar：默认主 venv 的 cpu 版 torch，实测 RTF 0.25~0.60 ✓）"""
     import json
-    proc = _kokoro_gpu_proc()
+    proc = _kokoro_sidecar_proc()
     if proc is None:
-        raise RuntimeError("未找到 GPU 解释器（venv-gpu/Scripts/python.exe）")
+        raise RuntimeError("未找到 sidecar 解释器（venv/Scripts/python.exe）")
     out = os.path.join(TMP_DIR, f"tts_{uuid.uuid4().hex}.wav")
     vname = voice if (voice and not voice.startswith("zh-CN")) else conf("tts.kokoroVoiceName", "zf_001")
     req = json.dumps({"text": text, "out": out, "voice": vname}, ensure_ascii=False)
-    with _kokoro_gpu_lock:
+    with _kokoro_sc_lock:
         proc.stdin.write(req + "\n")
         proc.stdin.flush()
-        line = proc.stdout.readline()
-    if not line:
-        raise RuntimeError("Kokoro GPU sidecar 无响应")
-    r = json.loads(line)
+        r = None
+        while r is None:
+            line = proc.stdout.readline()
+            if not line:
+                raise RuntimeError("Kokoro sidecar 无响应")
+            try:
+                cand = json.loads(line)
+            except Exception:
+                continue                          # 启动期的 WARNING 等非 JSON 行
+            if isinstance(cand, dict) and "ok" in cand:
+                r = cand
     if not r.get("ok"):
         raise RuntimeError(r.get("error", "未知错误"))
-    print(f"[tts] Kokoro-GPU 合成 {len(text)}字 ({r.get('ms')}ms, 音频 {r.get('dur')}s, "
-          f"显存 {r.get('vram')}MB, 音色 {vname})", file=sys.stderr, flush=True)
+    print(f"[tts] Kokoro 合成 {len(text)}字 ({r.get('ms')}ms, 音频 {r.get('dur')}s, "
+          f"设备 {r.get('device') or 'cpu'}{', 显存 %sMB' % r['vram'] if r.get('vram') else ''}, "
+          f"音色 {vname})", file=sys.stderr, flush=True)
     return r["path"]
 
 
@@ -607,15 +680,15 @@ def synthesize(text, voice="zh-CN-XiaoxiaoNeural"):
                 if p:
                     return p, "piper"
             elif backend == "kokoro":
-                # GPU 版 Kokoro 实测 RTF 1.5（比 CPU 的 0.9 还慢 ✗：MIOpen 对这个小模型
-                # 只走通用 GEMM 兜底）→ 默认走 CPU/ONNX；要用 GPU 需显式开 tts.kokoroUseGpu
-                if conf_bool("tts.kokoroUseGpu", False) and kokoro_gpu_python():
-                    p = synth_kokoro_gpu(text, voice)
+                # 常驻 sidecar（主 venv 的 cpu 版 torch + kokoro-deps）实测 RTF 0.25~0.60 ✓，
+                # 比 ONNX 路径（0.9~1.06）快约 4 倍 ✓；ONNX 仅作兜底
+                if kokoro_sidecar_python():
+                    p = synth_kokoro_sidecar(text, voice)
                     if p:
-                        return p, "kokoro-gpu"
+                        return p, "kokoro"
                 p = synth_kokoro(text, voice)
                 if p:
-                    return p, "kokoro"
+                    return p, "kokoro-onnx"
             elif backend == "sherpa":
                 if _local_disabled:
                     continue
@@ -793,6 +866,7 @@ def level_sender():
 # ========== Main Loop ==========
 def main():
     global _listen_active, _playback_active, _playback_since, _playback_off_at, _feed_mode, _stream, _player, _aec
+    global TTS_BACKEND, TTS_ORDER
 
     if TTS_PLAYBACK == "server":
         _player = Player(aec=_aec)
@@ -980,6 +1054,15 @@ def main():
                              "top": table[:5]})
                     except Exception as ce:
                         out({"type": "error", "error": f"标定失败: {ce}"})
+
+            elif action == "set_backend":
+                # 运行时热切换 TTS 后端（web 设置面板选音色时用）：不用重启 worker
+                b = str(cmd.get("backend", "")).strip().lower()
+                if b in ("piper", "kokoro", "sherpa", "edge") and b != TTS_BACKEND:
+                    TTS_BACKEND = b
+                    TTS_ORDER = _tts_order(b)
+                    print(f"[tts] 后端热切换 → {b}（兜底顺序 {TTS_ORDER}）", file=sys.stderr, flush=True)
+                out({"type": "ack", "cmd": "set_backend"})
 
             elif action == "ping":
                 out({"type": "pong"})

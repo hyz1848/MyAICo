@@ -5,7 +5,10 @@ __pycache__/
 # 依赖与虚拟环境
 node_modules/
 venv/
-venv-gpu/          # 独立的 ROCm GPU 环境（约 6GB，不入库）
+# 独立的 ROCm GPU 环境（约 6GB，不入库）
+venv-gpu/
+# Kokoro 依赖隔离目录（PYTHONPATH 注入，不入库）
+kokoro-deps/
 
 # 运行期数据（会话历史、提醒）
 data/

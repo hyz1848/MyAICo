@@ -23,7 +23,8 @@ const API = 'https://api.github.com';
 // 实际用于请求的 token：pushViaApi() 被调用时会覆盖（支持从凭据管理器传入）
 let activeToken = TOKEN;
 
-const git = (...args) => execFileSync('git', args, { cwd: __dirname, encoding: 'buffer' }).toString('utf8').trim();
+const git = (...args) => execFileSync('git', args,
+  { cwd: __dirname, encoding: 'buffer', maxBuffer: 64 * 1024 * 1024 }).toString('utf8').trim();
 
 async function api(method, url, body) {
   const res = await fetch(`${API}${url}`, {
@@ -79,7 +80,8 @@ async function pushViaApi(token, opts = {}) {
   const inlineEntries = [];   // 文本：直接内联
   const binaryFiles = [];     // 二进制：待上传 blob
   for (const f of ls) {
-    const buf = execFileSync('git', ['cat-file', 'blob', f.sha], { cwd: __dirname, maxBuffer: 64 * 1024 * 1024 });
+    const buf = execFileSync('git', ['cat-file', 'blob', f.sha],
+      { cwd: __dirname, maxBuffer: 64 * 1024 * 1024 });
     if (isBinary(buf)) binaryFiles.push({ ...f, buf });
     else inlineEntries.push({ path: f.path, mode: f.mode, type: 'blob', content: buf.toString('utf8') });
   }
@@ -108,7 +110,8 @@ async function pushViaApi(token, opts = {}) {
   if (!branchSha) {
     const seedPath = '.gitignore';
     const seedSha = git('rev-parse', `HEAD:${seedPath}`);
-    const seedBuf = execFileSync('git', ['cat-file', 'blob', seedSha], { cwd: __dirname });
+    const seedBuf = execFileSync('git', ['cat-file', 'blob', seedSha],
+      { cwd: __dirname, maxBuffer: 64 * 1024 * 1024 });
     const seed = await api('PUT', `/repos/${REPO}/contents/${seedPath}`, {
       message: 'chore: 初始化仓库',
       content: seedBuf.toString('base64'),

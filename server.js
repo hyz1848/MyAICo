@@ -9,7 +9,7 @@ for (const a of process.argv.slice(2)) {
   }
 }
 
-const { cfg } = require('./config');
+const { cfg, CONF_PATH } = require('./config');
 const { log } = require('./logger');
 
 const http = require('http');
@@ -75,7 +75,25 @@ function resolvePython() {
 const PYTHON_PATH = cfg.worker.python || resolvePython();
 const WORKER_PATH = toWinPath(path.join(__dirname, 'worker.py'));
 
-let currentVoice = cfg.tts.voice;
+let currentBackend = String(cfg.tts.backend || 'piper').toLowerCase();
+// 当前生效的音色：kokoro 用 kokoroVoiceName，其它用 voice
+let currentVoice = currentBackend === 'kokoro'
+  ? (cfg.tts.kokoroVoiceName || 'zf_001')
+  : cfg.tts.voice;
+
+function persistVoice(backend, voice) {
+  // 写回 conf.json：worker 侧 conf() 读的是启动时的快照，重启后才会从文件生效
+  try {
+    const c = JSON.parse(fs.readFileSync(CONF_PATH, 'utf8'));
+    c.tts = c.tts || {};
+    c.tts.backend = backend;
+    if (backend === 'kokoro') c.tts.kokoroVoiceName = voice; else c.tts.voice = voice;
+    fs.writeFileSync(CONF_PATH, JSON.stringify(c, null, 2), 'utf8');
+    log.info(`[TTS] 音色已持久化：${backend} / ${voice}`);
+  } catch (e) {
+    log.warn('[TTS] 音色持久化失败', e.message);
+  }
+}
 let playbackUntil = 0;
 let speakingUntil = 0;   // 由音频真实时长推算的"正在出声"窗口（不依赖浏览器心跳）
 let playbackState = false;   // 已下发给 worker 的播放状态，用于去重
@@ -119,6 +137,39 @@ function tripLoopBreaker(reason) {
 
 app.use(express.static(path.join(__dirname, 'public')));
 app.use('/temp', express.static(path.join(__dirname, 'temp')));
+
+// ========== 音色列表 + 试听样本（web 设置面板用）==========
+// Kokoro 音色名从模型目录动态读（zf_/zm_ 中文 + af_/bf_ 英文 ✓）；
+// 试听样本是离线预生成的 wav/mp3（temp/voices/ ✓），没有样本的音色也能选，只是听不了。
+const KOKORO_VOICES_DIR = path.join(__dirname, 'models', 'kokoro-torch', 'voices');
+const VOICE_SAMPLES_DIR = path.join(__dirname, 'temp', 'voices');
+const EDGE_VOICES = [
+  'zh-CN-XiaoxiaoNeural', 'zh-CN-XiaoyiNeural', 'zh-CN-YunxiNeural', 'zh-CN-YunyangNeural',
+  'zh-CN-YunjianNeural', 'zh-CN-XiaohanNeural', 'zh-CN-XiaomoNeural', 'zh-CN-XiaoruiNeural',
+  'zh-CN-XiaoxuanNeural', 'zh-CN-liaoning-XiaobeiNeural', 'zh-CN-shaanxi-XiaoniNeural',
+  'zh-HK-HiuMaanNeural', 'zh-HK-WanLungNeural', 'zh-TW-HsiaoChenNeural', 'zh-TW-YunJheNeural',
+];
+
+function isKokoroVoice(v) { return /^(z[fm]|a[fm]|b[fm])_[a-z0-9]+$/i.test(v); }
+
+app.get('/api/voices', (req, res) => {
+  let kokoro = [];
+  try {
+    kokoro = fs.readdirSync(KOKORO_VOICES_DIR)
+      .filter((f) => f.endsWith('.pt'))
+      .map((f) => f.replace(/\.pt$/, ''))
+      .filter(isKokoroVoice)
+      .sort();
+  } catch (e) { log.warn('[voices] 读 Kokoro 音色目录失败', e.message); }
+  const samples = {};
+  const pick = (key, file) => {
+    if (fs.existsSync(path.join(VOICE_SAMPLES_DIR, file))) samples[key] = '/temp/voices/' + file;
+  };
+  for (const v of kokoro) pick('kokoro:' + v, `kokoro_${v}.wav`);
+  for (const v of EDGE_VOICES) pick('edge:' + v, `edge_${v}.mp3`);
+  const backend = isKokoroVoice(currentVoice) ? 'kokoro' : currentBackend;
+  res.json({ kokoro, edge: EDGE_VOICES, samples, current: { voice: currentVoice, backend } });
+});
 
 // ========== Python Worker (recording + VAD + ASR + TTS) ==========
 let worker = null;
@@ -988,13 +1039,22 @@ wss.on('connection', (ws) => {
           }
           break;
         }
-        case 'set_voice':
-          if (msg.voice && msg.voice !== currentVoice) {
-            currentVoice = msg.voice;
+        case 'set_voice': {
+          const v = String(msg.voice || '').trim();
+          if (v && v !== currentVoice) {
+            // Kokoro 音色（zf_*/zm_*/af_*/bf_*）→ 切 kokoro 后端；其余按 edge 处理
+            const backend = isKokoroVoice(v) ? 'kokoro' : 'edge';
+            if (backend !== currentBackend) {
+              currentBackend = backend;
+              sendToWorker({ cmd: 'set_backend', backend });   // 热切换，不重启 worker
+            }
+            currentVoice = v;
+            persistVoice(backend, v);
             for (const k of Object.keys(prewarmPaths)) delete prewarmPaths[k];
             prewarmPhrases();   // 换音色后重新预生成
           }
           break;
+        }
         case 'text':
           if (msg.text) handleUserText(msg.text, false);
           break;

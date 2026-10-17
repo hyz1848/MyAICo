@@ -19,13 +19,13 @@ const REPO = process.env.GH_REPO || 'hyz1848/MyAICo';
 const BRANCH = process.env.GH_BRANCH || 'main';
 const API = 'https://api.github.com';
 
-const git = (...args) => execFileSync('git', args, { cwd: __dirname, encoding: 'utf8' }).trim();
+const git = (...args) => execFileSync('git', args, { cwd: __dirname, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 }).trim();
 
 function getToken() {
   if (process.env.GH_TOKEN || process.env.GITHUB_TOKEN) return process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
   try {
     const out = execFileSync('git', ['credential', 'fill'], {
-      cwd: __dirname, encoding: 'utf8',
+      cwd: __dirname, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024,
       input: 'protocol=https\nhost=github.com\n\n',
     });
     const m = out.match(/^password=(.+)$/m);
@@ -67,8 +67,15 @@ async function gitEndpointReachable() {
   // 1) git 端点通 → 先走标准推送；失败也不放弃，继续走 API
   if (await gitEndpointReachable()) {
     console.log('github.com git 端点可达 → 尝试标准 git push');
-    const r = spawnSync('git', ['push', '-u', 'origin', BRANCH], { cwd: __dirname, stdio: 'inherit' });
-    if (r.status === 0) process.exit(0);
+    // 不用 stdio:'inherit'：git 失败时输出较大，会把这层外壳的缓冲冲爆（ENOBUFS）
+    const r = spawnSync('git', ['push', '-u', 'origin', BRANCH],
+                        { cwd: __dirname, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
+    if (r.status === 0) {
+      process.stdout.write(r.stdout || '');
+      process.exit(0);
+    }
+    const errText = String(r.stderr || r.stdout || r.error?.message || '').trim();
+    console.log('git push 失败:', errText.slice(-300));
     console.log('git push 失败 → 改走 REST API');
   } else {
     console.log('github.com git 端点不可达 → 直接走 REST API');
