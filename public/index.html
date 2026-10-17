@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VoiceAI - 个人语音助理</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app">
+    <!-- Header -->
+    <header class="header">
+      <div class="logo">
+        <span class="logo-icon">🎙️</span>
+        <span class="logo-text">VoiceAI</span>
+      </div>
+      <div class="header-right">
+        <div class="status-indicator" id="statusIndicator">
+          <span class="status-dot"></span>
+          <span class="status-text">连接中...</span>
+        </div>
+        <button class="btn-icon" id="newSessionBtn" title="新会话">➕</button>
+        <button class="btn-icon" id="settingsBtn" title="设置">⚙️</button>
+      </div>
+    </header>
+
+    <!-- Settings Panel -->
+    <div class="settings-panel" id="settingsPanel">
+      <div class="settings-content">
+        <h3>设置</h3>
+        <div class="setting-item">
+          <label>TTS 语音</label>
+          <select id="ttsVoice">
+            <option value="zh-CN-XiaoxiaoNeural">晓晓 (女声)</option>
+            <option value="zh-CN-YunxiNeural">云希 (男声)</option>
+            <option value="zh-CN-YunyangNeural">云扬 (男声-新闻)</option>
+            <option value="zh-CN-XiaoyiNeural">晓伊 (女声-活泼)</option>
+          </select>
+        </div>
+        <div class="setting-item">
+          <label>麦克风来源</label>
+          <select id="captureSource">
+            <option value="browser">浏览器麦克风（WebRTC 回声消除）</option>
+            <option value="server">服务器麦克风</option>
+          </select>
+        </div>
+        <div class="setting-item">
+          <label>浏览器麦克风处理</label>
+          <div class="mic-opts">
+            <label><input type="checkbox" id="optEcho" checked> 回声消除</label>
+            <label><input type="checkbox" id="optNoise" checked> 降噪</label>
+            <label><input type="checkbox" id="optAgc" checked> 自动增益</label>
+          </div>
+          <p class="setting-hint">识别不出内容时，试着关掉「降噪」「自动增益」，或改用服务器麦克风。</p>
+        </div>
+        <button class="btn-primary" id="saveSettings">保存</button>
+      </div>
+    </div>
+
+    <!-- Chat Area -->
+    <main class="chat-container" id="chatContainer">
+      <div class="welcome-message" id="welcomeMessage">
+        <div class="welcome-icon">🎙️</div>
+        <h2>你好，我是你的 AI 助理</h2>
+        <p>点击麦克风，直接说话即可</p>
+        <p class="hint">说完自动识别 · FunASR paraformer + fsmn-vad 驱动</p>
+      </div>
+      <div class="messages" id="messages"></div>
+    </main>
+
+    <!-- Voice Level Visualizer -->
+    <div class="voice-visualizer" id="voiceVisualizer">
+      <div class="visualizer-bars" id="visualizerBars"></div>
+    </div>
+
+    <!-- Input Area -->
+    <footer class="input-area">
+      <div class="input-row">
+        <button class="mic-btn" id="micBtn" title="开启/关闭连续聆听">
+          <span class="mic-icon">🎤</span>
+        </button>
+        <div class="text-input-wrapper">
+          <input type="text" id="textInput" placeholder="或输入文字..." autocomplete="off">
+          <button class="send-btn" id="sendBtn" title="发送">➤</button>
+        </div>
+      </div>
+      <div class="input-hint" id="inputHint">点击麦克风，开始连续语音对话（说完自动识别）</div>
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

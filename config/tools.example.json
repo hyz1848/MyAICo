@@ -1,0 +1,10 @@
+{
+  "_comment": "工具配置模板：复制为 config/tools.json 并填入真实密钥（该文件已被 .gitignore 排除）",
+  "search": {
+    "provider": "bocha",
+    "url": "https://api.bochaai.com/v1/web-search",
+    "apiKey": "<在此填入你的密钥>",
+    "count": 5,
+    "freshness": "noLimit"
+  }
+}

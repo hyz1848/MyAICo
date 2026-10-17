@@ -1,0 +1,104 @@
+{
+  "_tts_note": "默认 piper：本地 VITS + DirectML(AMD GPU)，实测 RTF 0.02~0.05、单句 120~220ms。sherpa=本地 Kokoro（CPU 上 RTF 1.5，慢）；edge=网络合成（~1.2s/句）。三者互为兜底，末端是 edge。",
+  "_readme": "VoiceAI 统一配置。优先级：conf.json < 环境变量 < 命令行 --set=KEY=VALUE。改完需重启服务（worker 由服务拉起，会自动读同一份文件）。",
+  "port": 8214,
+  "capture": "browser",
+  "dataDir": "",
+  "log": {
+    "level": "info",
+    "dir": "",
+    "file": true
+  },
+  "llm": {
+    "baseUrl": "http://192.168.3.166:1234",
+    "model": "qwen3.8-27b",
+    "apiKey": "local",
+    "thinking": false,
+    "maxTokens": 2048,
+    "contextWindow": 256000,
+    "firstEventTimeoutMs": 90000,
+    "idleTimeoutMs": 30000,
+    "toolMaxRounds": 3,
+    "dump": ""
+  },
+  "history": {
+    "compressAt": 160000,
+    "keepRecent": 12,
+    "maxMessages": 400
+  },
+  "kvWarm": {
+    "_readme": "空闲时把当前线上序列原样再发一次(max_tokens=1)，加热服务端可能已被置换的 KV 缓存",
+    "enabled": true,
+    "idleMs": 60000,
+    "keepMs": 1800000,
+    "minMessages": 2,
+    "tickMs": 10000
+  },
+  "tts": {
+    "backend": "piper",
+    "provider": "auto",
+    "piperDir": "",
+    "voice": "zh-CN-XiaoxiaoNeural",
+    "modelDir": "",
+    "threads": 4,
+    "timeoutSec": 15,
+    "retries": 2,
+    "failLimit": 3,
+    "lookahead": 2
+  },
+  "asr": {
+    "model": "paraformer-zh",
+    "vadModel": "fsmn-vad",
+    "device": "cpu",
+    "targetRms": 0.1,
+    "maxGain": 8.0
+  },
+  "vad": {
+    "energyMin": 0.02,
+    "floorMax": 0.025,
+    "mult": 3.0,
+    "silenceMs": 1200,
+    "shortSilenceMs": 500,
+    "shortUtteranceS": 2.5,
+    "preRollBlocks": 5,
+    "maxUtteranceS": 30,
+    "playbackGateMult": 1.8,
+    "playbackSilenceMs": 900,
+    "playbackMaxUtteranceS": 12.0
+  },
+  "wake": {
+    "enabled": true,
+    "word": "潞潞同学",
+    "ack": "在呢",
+    "idleMs": 25000,
+    "minChars": 4
+  },
+  "echo": {
+    "tailMs": 900,
+    "windowMs": 25000,
+    "minMatch": 6
+  },
+  "bargeIn": {
+    "enabled": true,
+    "minChars": 5
+  },
+  "loopBreaker": {
+    "similarity": 0.5,
+    "hits": 3
+  },
+  "worker": {
+    "python": "",
+    "stallMs": 45000,
+    "audioMaxPending": 25,
+    "handshakeMs": 15000
+  },
+  "tools": {
+    "timeoutMs": 30000,
+    "configPath": "config/tools.json"
+  },
+  "debug": {
+    "noWorker": false,
+    "asrSim": false,
+    "emptyAsrDump": false
+  }
+}

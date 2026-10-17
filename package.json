@@ -1,0 +1,40 @@
+{
+  "name": "voiceai",
+  "version": "1.0.0",
+  "description": "Personal AI Voice Assistant",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "start:browser": "node server.js --capture=browser",
+    "test": "node test_chunker.js",
+    "test:echo": "node test_echo.js",
+    "test:prompt": "node test_prompt.js",
+    "test:calc": "node test_calc.js",
+    "test:tools": "node test_tools.js",
+    "test:tools-e2e": "node test_tools_e2e.js",
+    "test:tools-stability": "node test_tools_stability.js",
+    "test:voice": "node test_voice_input.js",
+    "test:wake": "node test_wake.js",
+    "test:wake-e2e": "node test_wake_e2e.js",
+    "test:reminder-e2e": "node test_reminder_e2e.js",
+    "test:aec": "python test_aec.py",
+    "test:agent": "node agent/test_pi_client.js",
+    "test:stream": "node test_stream.js",
+    "test:interrupt": "node test_interrupt.js",
+    "test:after-interrupt": "node test_after_interrupt.js",
+    "test:session": "node test_session.js",
+    "test:backpressure": "node test_backpressure.js",
+    "test:all": "node test_chunker.js && node agent/test_pi_client.js && node test_stream.js && node test_interrupt.js && node test_after_interrupt.js && node test_session.js && node test_backpressure.js"
+  },
+  "engines": {
+    "node": ">=22.19"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "^1.3.0",
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "express": "^4.22.3",
+    "pinyin-pro": "^3.29.5",
+    "winston": "^3.19.0",
+    "ws": "^8.22.0"
+  }
+}
