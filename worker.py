@@ -96,6 +96,26 @@ def cenv(env_name, path, default, cast=str):
 SAMPLE_RATE = 16000
 CHANNELS = 1
 BLOCK_SIZE = 1280  # 80ms
+# 采集必须用设备原生率 ✗ 实测同一只麦克风（MU900）用 16kHz 采集会被驱动静默压低 10~15 倍：
+#   MME 48k/单声道 → RMS 0.198、峰值 0.925；而 16k → RMS 0.013 ✗（这就是"电平不动/识别恒为空"的根因）
+# 所以按 CAPTURE_RATE（默认 48k）采集，再盒式平均抽取到 16k 供 VAD/ASR/AEC 使用 ✓
+CAPTURE_RATE = conf_int("asr.captureRate", 48000)
+DECIM = max(1, int(round(CAPTURE_RATE / float(SAMPLE_RATE))))   # 48000/16000 = 3
+_capture_carry = np.zeros(0, dtype=np.float32)
+
+
+def _decimate_capture(mono):
+    """原生率 → 16k：每 DECIM 个样本取均值（盒式低通，够 ASR 用 ✓），余数留到下一次避免时序漂移"""
+    global _capture_carry
+    if DECIM <= 1:
+        return mono
+    if _capture_carry.size:
+        mono = np.concatenate([_capture_carry, mono])
+    n = (mono.size // DECIM) * DECIM
+    _capture_carry = mono[n:].copy()
+    if n == 0:
+        return np.zeros(0, dtype=np.float32)
+    return mono[:n].reshape(-1, DECIM).mean(axis=1).astype(np.float32)
 
 VAD_ENERGY_MIN = conf_num("vad.energyMin", 0.02)    # absolute RMS floor for the gate
 VAD_FLOOR_MAX = conf_num("vad.floorMax", 0.025)    # 噪声底硬上限：超过这个值就可能把正常说话判成静音
@@ -320,6 +340,9 @@ def audio_callback(indata, frames, time_info, status):
     # 采集侧回声消除：先用 AEC 减去估计回声，再做 VAD/识别。
     # 参考信号由 Player 的播放回调提供（同进程、同时间轴），这是能真正消回声的前提。
     block = np.asarray(indata[:, 0], dtype=np.float32) if indata.ndim > 1 else np.asarray(indata, dtype=np.float32)
+    block = _decimate_capture(block)          # 原生率 → 16k（见 CAPTURE_RATE 注释）
+    if block.size == 0:
+        return
     if _aec is not None:
         block = _aec.process(block)
     if _listen_active and not _feed_mode:
@@ -458,7 +481,7 @@ SYNTH_TIMEOUT = cenv("VOICEAI_TTS_TIMEOUT", "tts.timeoutSec", 15, float)
 SYNTH_RETRIES = cenv("VOICEAI_TTS_RETRIES", "tts.retries", 2, int)
 def _tts_order(backend):
     """首选后端 + 其余兜底（末端 edge 网络合成）"""
-    return [backend] + [b for b in ("piper", "edge", "sherpa", "kokoro") if b != backend]
+    return [backend] + [b for b in ("piper", "melo", "edge", "sherpa", "kokoro") if b != backend]
 
 
 TTS_BACKEND = cenv("VOICEAI_TTS", "tts.backend", "piper", str).lower()   # piper | kokoro | sherpa | edge
@@ -472,6 +495,7 @@ _local_disabled = False     # 连续失败达上限后本次进程内不再尝�
 _missing_logged = False     # "模型未就绪"只提示一次，避免每句刷屏
 _piper_tts = None
 _kokoro_tts = None
+_melo_tts = None          # 本地 MeloTTS（sherpa-onnx，中英双语，中文韵律比 Kokoro-zh/Piper 自然 ✓）
 _kokoro_sc = None         # 常驻 sidecar 进程（默认主 venv 的 cpu 版 torch）
 _kokoro_sc_lock = None
 _piper_fails = 0
@@ -599,6 +623,9 @@ def _kokoro_sidecar_proc():
         return _kokoro_sc
 
 
+KOKORO_SPEED = conf_num("tts.kokoroSpeed", 1.0)   # 可被 set_speed 热改：语速偏慢会显得呆板 ✓
+
+
 def synth_kokoro_sidecar(text, voice=None):
     """Kokoro 合成（常驻 sidecar：默认主 venv 的 cpu 版 torch，实测 RTF 0.25~0.60 ✓）"""
     import json
@@ -607,7 +634,8 @@ def synth_kokoro_sidecar(text, voice=None):
         raise RuntimeError("未找到 sidecar 解释器（venv/Scripts/python.exe）")
     out = os.path.join(TMP_DIR, f"tts_{uuid.uuid4().hex}.wav")
     vname = voice if (voice and not voice.startswith("zh-CN")) else conf("tts.kokoroVoiceName", "zf_001")
-    req = json.dumps({"text": text, "out": out, "voice": vname}, ensure_ascii=False)
+    req = json.dumps({"text": text, "out": out, "voice": vname, "speed": KOKORO_SPEED},
+                     ensure_ascii=False)
     with _kokoro_sc_lock:
         proc.stdin.write(req + "\n")
         proc.stdin.flush()
@@ -624,10 +652,38 @@ def synth_kokoro_sidecar(text, voice=None):
                 r = cand
     if not r.get("ok"):
         raise RuntimeError(r.get("error", "未知错误"))
-    print(f"[tts] Kokoro 合成 {len(text)}字 ({r.get('ms')}ms, 音频 {r.get('dur')}s, "
+    print(f"[tts] Kokoro 合成 {len(text)}字 ({r.get('ms')}ms, 音频 {r.get('dur')}s, 语速 {KOKORO_SPEED}, "
           f"设备 {r.get('device') or 'cpu'}{', 显存 %sMB' % r['vram'] if r.get('vram') else ''}, "
           f"音色 {vname})", file=sys.stderr, flush=True)
     return r["path"]
+
+
+def _get_melo_tts():
+    global _melo_tts
+    if _melo_tts is None:
+        from tts_sherpa import SherpaTts
+        _melo_tts = SherpaTts(model_dir=conf("tts.meloDir") or None,
+                              threads=cenv("VOICEAI_TTS_THREADS", "tts.threads", 4, int))
+        print(f"[tts] MeloTTS 模型目录: {_melo_tts.model_dir} 可用={_melo_tts.available()}",
+              file=sys.stderr, flush=True)
+    return _melo_tts
+
+
+def synth_melo(text, voice=None):
+    """本地 MeloTTS 合成（sherpa-onnx）。voice 传数字字符串时当 speaker id ✓"""
+    t0 = time.time()
+    tts = _get_melo_tts()
+    if not tts.available():
+        raise RuntimeError(f"MeloTTS 模型未就绪: {tts.model_dir}")
+    sid = conf_int("tts.meloSid", 0)
+    if voice and str(voice).isdigit():
+        sid = int(voice)
+    speed = conf_num("tts.meloSpeed", 1.0)
+    out = os.path.join(TMP_DIR, f"tts_{uuid.uuid4().hex}.wav")
+    path, dur = tts.synthesize(text, out, sid=sid, speed=speed)
+    print(f"[tts] Melo 合成 {len(text)}字 ({(time.time() - t0) * 1000:.0f}ms, "
+          f"音频 {dur:.2f}s, speaker {sid})", file=sys.stderr, flush=True)
+    return path
 
 
 def _get_local_tts():
@@ -703,6 +759,11 @@ def synthesize(text, voice="zh-CN-XiaoxiaoNeural"):
                 p = synth_piper(text, voice)
                 if p:
                     return p, "piper"
+            elif backend == "melo":
+                # 本地 MeloTTS（sherpa-onnx，中英）：中文韵律明显比 Piper/Kokoro-zh 自然 ✓
+                p = synth_melo(text, voice)
+                if p:
+                    return p, "melo"
             elif backend == "kokoro":
                 # 常驻 sidecar（主 venv 的 cpu 版 torch + kokoro-deps）实测 RTF 0.25~0.60 ✓，
                 # 比 ONNX 路径（0.9~1.06）快约 4 倍 ✓；ONNX 仅作兜底
@@ -896,7 +957,8 @@ def main():
         _player = Player(aec=_aec)
 
     print(f"[conf] {CONF_PATH} | TTS={TTS_BACKEND} 语音窗={SILENCE_MS}ms 门限={VAD_ENERGY_MIN}x{VAD_MULT} "
-          f"ASR={conf('asr.model', 'paraformer-zh')}", file=sys.stderr, flush=True)
+          f"ASR={conf('asr.model', 'paraformer-zh')} "
+              f"采集={CAPTURE_RATE}Hz/抽取1:{DECIM}→{SAMPLE_RATE}Hz", file=sys.stderr, flush=True)
 
     threading.Thread(target=stdin_reader, daemon=True).start()
     threading.Thread(target=level_sender, daemon=True).start()
@@ -919,10 +981,10 @@ def main():
                     _feed_mode = cmd.get("source") == "browser"
                     if not _feed_mode:
                         _stream = sd.InputStream(
-                            samplerate=SAMPLE_RATE,
+                            samplerate=CAPTURE_RATE,          # ★ 原生率采集 ✗ 用 16k 会被驱动压低 10~15 倍
                             channels=CHANNELS,
                             dtype=np.float32,
-                            blocksize=BLOCK_SIZE,
+                            blocksize=BLOCK_SIZE * DECIM,     # 保证抽取后正好是 80ms（下游块大小不变 ✓）
                             callback=audio_callback,
                         )
                         _stream.start()
@@ -1085,6 +1147,16 @@ def main():
                              "top": table[:5]})
                     except Exception as ce:
                         out({"type": "error", "error": f"标定失败: {ce}"})
+
+            elif action == "set_speed":
+                # 语速热调（web 设置面板）；Kokoro 侧车每句读一次 ✓
+                global KOKORO_SPEED
+                try:
+                    KOKORO_SPEED = max(0.5, min(2.0, float(cmd.get("speed", 1.0))))
+                    print(f"[tts] 语速热调 → {KOKORO_SPEED}", file=sys.stderr, flush=True)
+                except (TypeError, ValueError):
+                    pass
+                out({"type": "ack", "cmd": "set_speed"})
 
             elif action == "set_backend":
                 # 运行时热切换 TTS 后端（web 设置面板选音色时用）：不用重启 worker

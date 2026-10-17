@@ -58,7 +58,8 @@
     "outputDevice": "9",
     "outputRate": 0,
     "_output_note": "服务端放音设备：可填设备索引（如 9）或名字子串；留空=系统默认（本机默认是 MME 的 #3 ✗）。本机可用端点：#9 34G6K-PRO DirectSound 44100 ✓（已验证出声）、#12 同端点 WASAPI 48000（更好但未验证）、#14 扬声器(MU900) WASAPI 48000。outputRate=0 表示用设备原生采样率（不要用 16000 ✗ 会发闷）",
-    "outputChannels": 0
+    "outputChannels": 0,
+    "kokoroSpeed": 1.15
   },
   "aec": {
     "_readme": "声学回声消除：只在 Python 端放音时生效（tts.playback = server/both/auto ✓；参考信号需与采集同进程）",
@@ -71,12 +72,14 @@
     "vadModel": "fsmn-vad",
     "device": "cpu",
     "targetRms": 0.1,
-    "maxGain": 40,
-    "_note_gain": "ASR 前归一化增益上限（原 8 ✗ 对低电平麦克风不够；过大会放大底噪，但噪声只会得到空结果，不会误识别）"
+    "maxGain": 8,
+    "_note_gain": "ASR 前归一化增益上限（原 8 ✗ 对低电平麦克风不够；过大会放大底噪，但噪声只会得到空结果，不会误识别）",
+    "captureRate": 48000,
+    "_note_capture": "采集采样率（必须用设备原生率 ✗）。实测同一只 MU900：48k/单声道 RMS 0.198、16k 只有 0.013 → 16k 采集被驱动静默压低 10~15 倍，表现为「电平不动 + 识别恒为空」。worker 会盒式平均抽取到 16k 供 VAD/ASR/AEC 使用"
   },
   "vad": {
-    "energyMin": 0.004,
-    "floorMax": 0.025,
+    "energyMin": 0.02,
+    "floorMax": 0.08,
     "mult": 3,
     "silenceMs": 1200,
     "shortSilenceMs": 500,
@@ -86,7 +89,8 @@
     "playbackGateMult": 1.8,
     "playbackSilenceMs": 900,
     "playbackMaxUtteranceS": 12,
-    "_note_min": "绝对能量门限（RMS）。本机麦克风 MU900 电平曾掉到 ~0.002（系统/驱动改的 ✗）→ 原来 0.02 会完全收不到"
+    "_note_min": "绝对能量门限（RMS）。本机麦克风 MU900 电平曾掉到 ~0.002（系统/驱动改的 ✗）→ 原来 0.02 会完全收不到",
+    "_note_threshold": "阈值 = max(energyMin, 噪声底×mult)。本机实测：安静 0.006~0.034、说话峰值 0.29。floorMax 必须高于房间噪声底，否则噪声底被卡在上限、阈值压不住噪声 → VAD 一直判\"还在说话\"→ 永不触发识别"
   },
   "wake": {
     "enabled": true,
@@ -122,5 +126,6 @@
     "noWorker": false,
     "asrSim": false,
     "emptyAsrDump": false
-  }
+  },
+  "_capture_note": "采集来源默认值：server=用服务器本机的 sounddevice 麦克风（本机场景 ✓ 已修为 48kHz 原生率采集 ✓）；browser=用网页所在设备的麦克风（远程场景 ✓ 需浏览器授权麦克风）"
 }

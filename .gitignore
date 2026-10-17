@@ -16,6 +16,9 @@ data/
 # 日志
 logs/
 
+# 本地 TTS 模型（体积大，按需下载）
+models/tts/
+models/*.tar.bz2
 # 模型权重（体积大，按需下载）
 models/*.tar.bz2
 models/kokoro-*/

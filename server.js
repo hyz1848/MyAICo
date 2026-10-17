@@ -1080,6 +1080,17 @@ wss.on('connection', (ws) => {
           }
           break;
         }
+        case 'set_speed': {
+          const sp = Math.max(0.5, Math.min(2.0, Number(msg.speed) || 1.0));
+          sendToWorker({ cmd: 'set_speed', speed: sp });     // 热调，不用重启 ✓
+          try {
+            const c = JSON.parse(fs.readFileSync(CONF_PATH, 'utf8'));
+            c.tts = c.tts || {}; c.tts.kokoroSpeed = sp;
+            fs.writeFileSync(CONF_PATH, JSON.stringify(c, null, 2), 'utf8');
+            log.info(`[TTS] 语速已持久化：${sp}`);
+          } catch (e) { log.warn('[TTS] 语速持久化失败', e.message); }
+          break;
+        }
         case 'text':
           if (msg.text) handleUserText(msg.text, false);
           break;

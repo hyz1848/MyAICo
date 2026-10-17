@@ -641,8 +641,10 @@ registerProcessor('pcm-capture', PcmCapture);
     const voice = $('ttsVoice').value;
     const opts = getMicOptions();
     const source = $('captureSource') ? $('captureSource').value : captureMode;
+    const speed = $('ttsSpeed') ? Number($('ttsSpeed').value) : 1;
     if (isConnected) ws.send(JSON.stringify({ type: 'set_voice', voice }));
-    localStorage.setItem('voiceai_settings', JSON.stringify({ voice, ...opts, source }));
+    if (isConnected && speed) ws.send(JSON.stringify({ type: 'set_speed', speed }));   // 语速热调 ✓（不用重启）
+    localStorage.setItem('voiceai_settings', JSON.stringify({ voice, speed, ...opts, source }));
     settingsPanel.classList.remove('open');
 
     const wasListening = isListening;
@@ -671,6 +673,7 @@ registerProcessor('pcm-capture', PcmCapture);
     try {
       const s = JSON.parse(saved);
       if (s.voice) $('ttsVoice').value = s.voice;
+      if (s.speed && $('ttsSpeed')) { $('ttsSpeed').value = String(s.speed); }
       if (typeof s.echo === 'boolean' && $('optEcho')) $('optEcho').checked = s.echo;
       if (typeof s.noise === 'boolean' && $('optNoise')) $('optNoise').checked = s.noise;
       if (typeof s.agc === 'boolean' && $('optAgc')) $('optAgc').checked = s.agc;
