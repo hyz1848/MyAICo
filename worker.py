@@ -322,7 +322,9 @@ def audio_callback(indata, frames, time_info, status):
     block = np.asarray(indata[:, 0], dtype=np.float32) if indata.ndim > 1 else np.asarray(indata, dtype=np.float32)
     if _aec is not None:
         block = _aec.process(block)
-    if _listen_active:
+    if _listen_active and not _feed_mode:
+        # 浏览器采集时由 handle_audio_frame 喂数据；这里再掺服务器麦克风会把两路音频
+        # 交错进同一个 VAD 队列 → 切成垃圾片段 → 识别必然为空 ✗
         push_block(block)
     rms = float(np.sqrt(np.mean(block * block)))
     try:

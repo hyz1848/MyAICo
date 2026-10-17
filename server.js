@@ -31,9 +31,14 @@ const CAPTURE_MODE = (ARG_CAPTURE || cfg.capture || 'server').toLowerCase();
 const AUDIO_FRAME_MAX_PENDING = cfg.worker.audioMaxPending;
 let audioPending = 0;   // 已入队/在飞音频帧数，超限丢弃以保持低延迟
 let statRecv = 0, statDrop = 0, statAck = 0, statWin = Date.now();
+// 当前会话**实际**使用的采集源：listen 时由浏览器上报的 source 决定 ✓
+// ✗ 不能用 CAPTURE_MODE（启动配置）：网页选"浏览器麦克风"时服务端配置仍是 server，
+//   两边门控不一致会让浏览器音频在这里被整帧丢弃，而 worker 又在等浏览器喂音频
+//   → 电平条在动（浏览器侧）但识别永远是空（服务端只听到服务器麦克风的静音）✓
+let activeSource = CAPTURE_MODE;
 
 function sendAudioFrame(buf) {
-  if (CAPTURE_MODE !== 'browser') return;
+  if (activeSource !== 'browser') return;
   if (!worker || !worker.stdin || !worker.stdin.writable) return;
   statRecv++;
   if (audioPending >= AUDIO_FRAME_MAX_PENDING) { statDrop++; return; }   // 背压：丢帧保实时
@@ -1026,6 +1031,7 @@ wss.on('connection', (ws) => {
         case 'listen': {
           audioPending = 0;
           const source = msg.source || CAPTURE_MODE;
+          activeSource = source === 'browser' ? 'browser' : 'server';   // 与下面转发给 worker 的 source 保持一致 ✓
           log.info('[capture] listen 请求来源:', source);
           sendToWorker({ cmd: 'listen', source: source === 'browser' ? 'browser' : 'server' });
           break;
