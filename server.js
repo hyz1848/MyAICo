@@ -444,7 +444,8 @@ const BARGE_IN = cfg.bargeIn.enabled;
 // 播报中打断所需的最短字数：环境里的短碎片（"是不是""接电话"）不该打断
 const BARGE_IN_MIN_CHARS = cfg.bargeIn.minChars;
 // 放音方式：server = Python 端放音（配合 AEC），browser = 浏览器播放
-const SERVER_PLAYBACK = String(cfg.tts.playback || 'server').toLowerCase() === 'server';
+const PLAYBACK_MODE = String(cfg.tts.playback || 'server').toLowerCase();   // server|browser|both|auto
+const SERVER_PLAYBACK = ['server', 'both', 'auto'].includes(PLAYBACK_MODE);
 
 let piClientPromise = null;
 function getLLM() {
@@ -993,7 +994,7 @@ wss.on('connection', (ws) => {
   // 新连接（含刷新页面）恢复既有会话 + 告知采集模式
   if (ws.readyState === 1) {
     ws.send(JSON.stringify({ type: 'history', summary, messages: history, tokens: historyTokens() }));
-    ws.send(JSON.stringify({ type: 'hello', capture: CAPTURE_MODE, playback: SERVER_PLAYBACK ? 'server' : 'browser', sampleRate: 16000, frameSamples: 1280, wakeWord: cfg.wake.word, wakeRequired: WAKE_REQUIRED, awake: wakeGate.awake }));
+    ws.send(JSON.stringify({ type: 'hello', capture: CAPTURE_MODE, playback: PLAYBACK_MODE, sampleRate: 16000, frameSamples: 1280, wakeWord: cfg.wake.word, wakeRequired: WAKE_REQUIRED, awake: wakeGate.awake }));
   }
 
   ws.on('message', (data, isBinary) => {
@@ -1109,7 +1110,7 @@ function announce(text) {
   const cached = prewarmPaths[text];
   if (cached) {
     // 预生成过的短句：直接播已合成的音频，省掉 1~2 秒合成延迟
-    broadcast({ type: 'tts_audio', audio_path: cached, text, id });
+    broadcast({ type: 'tts_audio', audio_path: cached, text, id, play_mode: PLAYBACK_MODE });
   } else {
     enqueueSpeech(id, text);
     finishSpeech(id);

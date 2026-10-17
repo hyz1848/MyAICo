@@ -1,5 +1,27 @@
 # VoiceAI 状态快照（2026-10-17 晚 更新）
 
+## ✅ 双语音端（本地 Python / 远程浏览器）已实现并验证
+需求原文：「浏览器 和 Python 作为语音端 都要支持！！ 远程就只能浏览器」
+
+`tts.playback` 现有 4 档 ✓（默认 **auto** ✓）：
+| 值 | 服务器喇叭 (Python) | 浏览器 |
+|---|---|---|
+| `server` | ✓ | ✗ |
+| `browser` | ✗ | ✓ |
+| `both` | ✓ | ✓ |
+| **`auto`** | ✓（AEC 参考 ✓） | **仅远程** ✓（本地不播 ✗ 避免同屋双响） |
+
+判定发生在**浏览器**侧 ✓（`location.hostname` 是否 localhost/127.0.0.1/::1 ✓）：
+worker 在 `tts_audio` 里带 `play_mode` ✓ → app.js 决策 ✓（`browser|both|auto+remote` ✓）。
+
+**实测证据**（同一句话，两个标签页，同一时刻）：
+| 页面 | hostname | 浏览器 new Audio() | 服务端消息 |
+|---|---|---|---|
+| 本地 | localhost | `[]` ✓ 不播 | `played=server` `mode=auto` ✓ |
+| 远程 | 192.168.3.170 | `["tts_f80050...wav"]` ✓ 播了 | 同上 ✓ |
+
+AEC 在 `server`/`both`/`auto` 下启用 ✓（`PLAY_SERVER` ✓；远程时服务器喇叭仍放 ✓ = 参考信号完整 ✓）。
+
 ## ✅ 本轮修掉的声音问题（4 个真 bug，全部有日志证据）
 用户报障链：听不到声音 → 声音呆板 → 唤醒后时有气泡但无声音。根因**四个叠加**：
 

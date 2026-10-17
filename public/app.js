@@ -188,15 +188,22 @@
         updateInputHint('normal');
         break;
 
-      case 'tts_audio':
+      case 'tts_audio': {
         if (msg.id !== undefined && currentReplyId && msg.id !== currentReplyId) break;
-        // 服务端放音：音频已由 Python 端播给声卡了，浏览器只显示文字，别再放一遍（否则双重出声）
-        if ((msg.played || playbackMode) === 'server') {
+        // 是否由浏览器放：server=否（Python 已在服务器喇叭放过 ✓）；
+        // browser=是；both=两边都放；auto=服务器照常放 ✓ 且**远程**浏览器也要放 ✓
+        // （本地浏览器不播 ✗ 否则和服务器喇叭同屋双响）
+        const mode = String(msg.play_mode || playbackMode || 'server').toLowerCase();
+        const host = location.hostname;
+        const isRemote = !(host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]' || host === '');
+        const browserPlays = mode === 'browser' || mode === 'both' || (mode === 'auto' && isRemote);
+        if (!browserPlays) {
           noteServerPlayback(msg.text);
           break;
         }
         playAudio(msg.audioPath || msg.audio_path, msg.text);
         break;
+      }
 
       case 'asr_error':
       case 'error':

@@ -131,8 +131,12 @@ _stream = None
 # ========== 服务端放音 + AEC ==========
 # 为什么必须同进程：AEC 的参考信号 = 我们喂给声卡的样本，要与麦克风严格同源同时间轴。
 # 浏览器放音时参考信号在浏览器里，Python 侧拿不到 → 只能靠能量门限/内容比对硬扛（就是之前的状态）。
-TTS_PLAYBACK = cenv("VOICEAI_PLAYBACK", "tts.playback", "server", str).lower()   # server | browser
-AEC_ENABLED = conf_bool("aec.enabled", True) and TTS_PLAYBACK == "server"
+TTS_PLAYBACK = cenv("VOICEAI_PLAYBACK", "tts.playback", "server", str).lower()   # server|browser|both|auto
+# server = 只服务器喇叭（可做 AEC ✓）；browser = 只有浏览器（纯远程 ✓，服务器不吵）
+# both = 两边都放；auto = 服务器照常放 ✓ + 远程浏览器也放 ✓（本地浏览器不播，避免同屋双响 ✗）
+PLAY_SERVER = TTS_PLAYBACK in ("server", "both", "auto")
+PLAY_BROWSER = TTS_PLAYBACK in ("browser", "both", "auto")
+AEC_ENABLED = conf_bool("aec.enabled", True) and PLAY_SERVER
 
 _aec = None
 if AEC_ENABLED:
@@ -868,7 +872,7 @@ def main():
     global _listen_active, _playback_active, _playback_since, _playback_off_at, _feed_mode, _stream, _player, _aec
     global TTS_BACKEND, TTS_ORDER
 
-    if TTS_PLAYBACK == "server":
+    if PLAY_SERVER:
         _player = Player(aec=_aec)
 
     print(f"[conf] {CONF_PATH} | TTS={TTS_BACKEND} 语音窗={SILENCE_MS}ms 门限={VAD_ENERGY_MIN}x{VAD_MULT} "
@@ -957,15 +961,17 @@ def main():
                     except Exception:
                         duration = len(text) / 4.5   # 估个大概：中文约 4.5 字/秒
                     played = "browser"
-                    if TTS_PLAYBACK == "server" and _player is not None:
+                    if PLAY_SERVER and _player is not None:
                         try:
                             _player.enqueue(audio_path, rid)
                             played = "server"
                         except Exception as pe:
                             print(f"[tts] 服务端放音入队失败，改由浏览器播放: {pe}",
                                   file=sys.stderr, flush=True)
+                    # play_mode 交给浏览器判断是否也要放（auto 模式下远程浏览器要放 ✓ 本地不播 ✓）
                     out({"type": "tts_audio", "audio_path": audio_path, "text": text, "id": rid,
-                         "backend": backend, "duration": round(duration, 2), "played": played})
+                         "backend": backend, "duration": round(duration, 2),
+                         "played": played, "play_mode": TTS_PLAYBACK})
 
             elif action == "prewarm_tts":
                 # 预生成常用短语音（唤醒应答等），避免每次现合成带来的 1~2 秒延迟
