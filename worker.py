@@ -165,7 +165,8 @@ if AEC_ENABLED:
         _aec = EchoCanceller(sample_rate=SAMPLE_RATE,
                              taps=conf_int("aec.taps", 2048),
                              delay_samples=conf_int("aec.delaySamples", 0),
-                             mu=conf_num("aec.mu", 0.4))
+                             mu=conf_num("aec.mu", 0.4),
+                             res_floor=conf_num("aec.resFloor", 1.0))   # 1.0=关闭 RES ✓（见 conf 注释）
         print(f"[aec] 已启用 taps={conf_int('aec.taps', 2048)} "
               f"delay={conf_int('aec.delaySamples', 0)} 样本 mu={conf_num('aec.mu', 0.4)}",
               file=sys.stderr, flush=True)
@@ -235,6 +236,7 @@ class Player:
         if self._stream is None:
             self._stream = sd.OutputStream(samplerate=self.sr, channels=self.ch, dtype="float32",
                                            blocksize=self.bs, device=self.device,
+                                           latency="low",      # ✗ 默认缓冲在 MME 上约 500ms（标定 delay 570ms ✗）→ 低延迟 ✓
                                            callback=self._callback)
             self._stream.start()
             try:
@@ -250,8 +252,17 @@ class Player:
         if data.ndim > 1:
             data = data.mean(axis=1)
         out = resample(data, sr, self.sr)
-        # AEC 参考必须与麦克风同率同时间轴（环形缓冲按样本计数对齐）
-        ref = out if self.sr == self.aec_rate else resample(data, sr, self.aec_rate)
+        # AEC 参考必须与麦克风同率**且相位一致** ✓
+        # ✗ 曾经用 44100→16000 的分数比线性重采样：声卡自己也重采样，两者群延迟不一致 → 滤波器对不齐 → ERLE 恒为 0
+        # ✓ 所以输出取设备支持的 48000（3:1 整数倍），参考用盒式平均精确抽取，与采集端同一套
+        if self.sr == self.aec_rate:
+            ref = out
+        elif self.sr % self.aec_rate == 0:
+            k = self.sr // self.aec_rate
+            n = (len(out) // k) * k
+            ref = out[:n].reshape(-1, k).mean(axis=1).astype(np.float32) if n else np.zeros(0, dtype=np.float32)
+        else:
+            ref = resample(data, sr, self.aec_rate)
         with self._lock:
             self._items.append((item_id, out, ref))
         self._ensure_stream()
@@ -329,9 +340,21 @@ def push_block(arr):
     _block_queue.put(arr)
 
 
+def _json_fallback(o):
+    """json 不认 numpy 标量 ✗ 之前标定消息就是这样整条发不出去（"Object of type bool is not JSON serializable"）
+    → 兜底转换，但把类型打到 stderr，避免静默掩盖问题 ✗"""
+    item = getattr(o, "item", None)
+    if callable(item):
+        v = item()
+        print(f"[json] numpy 标量被自动转换: {type(o).__name__} → {type(v).__name__}",
+              file=sys.stderr, flush=True)
+        return v
+    raise TypeError(f"不可序列化: {type(o).__name__}")
+
+
 def out(obj):
     with _print_lock:
-        sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        sys.stdout.write(json.dumps(obj, ensure_ascii=False, default=_json_fallback) + "\n")
         sys.stdout.flush()
 
 
@@ -586,6 +609,11 @@ def _kokoro_sidecar_env():
     免得 Kokoro 的 transformers/tokenizers/scipy 与主 venv 的 funasr 打架 ✗"""
     env = dict(os.environ)
     env.setdefault("PYTHONIOENCODING", "utf-8")
+    # torch 启动时读 OMP/MKL 线程数 → 用环境变量传，最省事 ✓（此前 tts.threads 是死配置 ✗）
+    _th = str(cenv("VOICEAI_TTS_THREADS", "tts.threads", 4, int))
+    env["OMP_NUM_THREADS"] = _th
+    env["MKL_NUM_THREADS"] = _th
+    env["VOICEAI_TTS_THREADS"] = _th
     dep = conf("tts.kokoroSidecarPath") or os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "kokoro-deps")
     if os.path.isdir(dep):
@@ -985,6 +1013,7 @@ def main():
                             channels=CHANNELS,
                             dtype=np.float32,
                             blocksize=BLOCK_SIZE * DECIM,     # 保证抽取后正好是 80ms（下游块大小不变 ✓）
+                            # ✗ 采集不要用 latency="low"：MME 上实测会丢块/断续 → ASR 全空（用户现场就是这症状）
                             callback=audio_callback,
                         )
                         _stream.start()
@@ -1142,9 +1171,9 @@ def main():
                             print(f"[aec] 就地标定并应用 delay={best[0]} 样本 "
                                   f"({best[0] / SAMPLE_RATE * 1000:.0f}ms) ERLE={best[1]:.1f}dB",
                                   file=sys.stderr, flush=True)
-                        out({"type": "aec_calibrated", "delay": best[0],
-                             "erle": round(best[1], 1), "applied": best[1] > 2.0,
-                             "top": table[:5]})
+                        out({"type": "aec_calibrated", "delay": int(best[0]),
+                             "erle": round(float(best[1]), 1), "applied": bool(best[1] > 2.0),
+                             "top": [[round(float(e), 1), int(d)] for (e, d) in table[:5]]})
                     except Exception as ce:
                         out({"type": "error", "error": f"标定失败: {ce}"})
 

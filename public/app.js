@@ -93,6 +93,18 @@
         if (captureMode === 'browser') {
           updateInputHint('browser-mic');
         }
+        // ✗ 服务重启后页面只会重连、不会重新发起聆听 → 表现为"我说了没反应"（麦克风实际没开）
+        // ✓ 若刷新前是开启状态（localStorage 记住），重连后自动恢复聆听
+        if (!isListening && localStorage.getItem('voiceai_listening') === '1') {
+          setTimeout(() => {
+            if (!isListening && isConnected) {
+              if (captureMode === 'browser') {
+                startBrowserCapture().catch((e) => addNotice('浏览器麦克风不可用：' + (e.name || e.message)));
+              }
+              ws.send(JSON.stringify({ type: 'listen', source: captureMode }));
+            }
+          }, 400);
+        }
         break;
 
       case 'vad_state':
@@ -252,6 +264,7 @@
     switch (state) {
       case 'listening':
         isListening = true;
+        try { localStorage.setItem('voiceai_listening', '1'); } catch (e) {}
         micBtn.classList.add('recording');
         visualizer.classList.add('active');
         inputHint.className = 'input-hint listening';
@@ -267,6 +280,7 @@
         break;
       default:
         isListening = false;
+        try { localStorage.setItem('voiceai_listening', '0'); } catch (e) {}
         micBtn.classList.remove('recording');
         visualizer.classList.remove('active');
         updateInputHint('normal');

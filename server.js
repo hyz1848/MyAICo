@@ -752,6 +752,15 @@ function handleUserText(text, fromVoice) {
   // 唤醒词门控：待命时任何人的话都不该触发回复（电视/旁人/回声残留）
   if (fromVoice) {
     const gate = wakeGate.handle(input);
+    // ★ 停止词优先于唤醒门控 ✓
+    // ✗ 原来只在"未唤醒"分支里检查：唤醒状态下直接喊「别说了」时 gate.text 被剥成空串，
+    //   随即在 `if (!input) return 'wake'` 被静默丢掉 → 表现就是"喊停没反应" ✗
+    if (stop && (playbackActiveNow() || activeLLM)) {
+      log.info('[StopWord] interrupt:', JSON.stringify(input.slice(0, 20)),
+               `(playing=${playbackActiveNow()} llm=${!!activeLLM})`);
+      interrupt();
+      return 'stop';
+    }
     if (!gate.accept) {
       if (gate.woke) {
         log.info('[Wake] 已唤醒:', JSON.stringify(gate.reason));
@@ -759,12 +768,7 @@ function handleUserText(text, fromVoice) {
         announce(WAKE_ACK);
         return 'wake';
       }
-      // 未唤醒：仍允许播报中说"停止"（否则会出现"停不下来"）
-      if (stop && playbackActiveNow()) {
-        log.info('[StopWord] interrupt (voice, 待命期播报中)');
-        interrupt();
-        return 'stop';
-      }
+      // 停止词已在上方统一处理（待命态/唤醒态都生效 ✓），这里不再重复
       log.info('[Wake] 待命中，忽略:', JSON.stringify(input.slice(0, 24)), `(${gate.reason})`);
       return 'ignored';
     }
