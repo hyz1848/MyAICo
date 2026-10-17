@@ -276,6 +276,12 @@ function startWorker() {
             statAck++;
             audioPending = Math.max(0, audioPending - 1);
           }
+          // clear 回执 = worker 已把 clear 之前及紧随其后入队的 tts 全部丢弃：
+          // 此时才解除撤回草稿时的暂停，只合成"撤回之后"的句子。
+          if (result.type === 'ack' && result.cmd === 'clear' && currentTtsId !== null) {
+            const cbuf = ttsBuffers.get(currentTtsId);
+            if (cbuf && cbuf.paused) { cbuf.paused = false; pumpTts(currentTtsId); }
+          }
           if (result.type !== 'ack' && !suppressBroadcast) broadcast(result);   // 回执只用于释放闩锁；被丢弃的识别结果不回显
         }
       } catch (e) {}
@@ -471,14 +477,14 @@ function getLLM() {
 // 既浪费 CPU 又让打断变慢。这里只允许提前合成 TTS_LOOKAHEAD 句，
 // 其余句留在 server 侧队列，等 tts_audio 返回后再放下一句。
 const TTS_LOOKAHEAD = cfg.tts.lookahead;
-const ttsBuffers = new Map();   // replyId -> { queue:[], inflight:0, voice, done }
+const ttsBuffers = new Map();   // replyId -> { queue:[], inflight:0, voice, done, paused }
 let currentTtsId = null;
 
 function enqueueSpeech(id, text) {
   if (!text) return;
   if (id !== currentTtsId) { currentTtsId = id; ttsBuffers.clear(); }  // 新一轮回复丢弃旧的
   let buf = ttsBuffers.get(id);
-  if (!buf) { buf = { queue: [], inflight: 0, voice: currentVoice, done: false }; ttsBuffers.set(id, buf); }
+  if (!buf) { buf = { queue: [], inflight: 0, voice: currentVoice, done: false, paused: false }; ttsBuffers.set(id, buf); }
   buf.queue.push(text);
   pumpTts(id);
 }
@@ -486,6 +492,9 @@ function enqueueSpeech(id, text) {
 function pumpTts(id) {
   const buf = ttsBuffers.get(id);
   if (!buf) return;
+  // 撤回工具前草稿后、worker 的 clear 回执到来前，暂停派发：此时发出去的 tts
+  // 会被 worker 的 clear 一起丢掉，那条 tts_audio 永远不回 → inflight 泄漏 → 整段回答静音。
+  if (buf.paused) return;
   while (buf.inflight < TTS_LOOKAHEAD && buf.queue.length) {
     const t = buf.queue.shift();
     buf.inflight++;
@@ -895,6 +904,11 @@ async function sendToLLM(text) {
           log.info('[Tools] 丢弃工具前草稿:', JSON.stringify(scratch.slice(0, 60)));
           fullText = fullText.slice(0, roundStart);
           broadcast({ type: 'llm_retract', chars: scratch.length, id });
+          // 撤回草稿必须同时重置服务端 TTS 状态：不然队列里超出前瞻窗的草稿句还会被继续合成
+          // （用户听到已撤回的内容），且 worker 的 clear 会连带丢掉 clear 之后才入队的句子，
+          // 那些 tts_audio 永不返回 → inflight 永不归零 → 本轮剩余回答不再合成（整段静音）。
+          const rbuf = ttsBuffers.get(id);
+          if (rbuf) { rbuf.queue.length = 0; rbuf.inflight = 0; rbuf.paused = true; }
           sendToWorker({ cmd: 'clear' });          // 丢掉草稿的待合成语音
           broadcast({ type: 'drop_queued_audio' }); // 浏览器：停当前音频并清队列（保留本轮 id）
         }
@@ -938,7 +952,11 @@ async function sendToLLM(text) {
       }
     }
 
-    for (const c of chunker.flush()) enqueueSpeech(id, c);
+    // 打断/被新问题取代后，旧 id 已经作废：此时还 flush 会让 enqueueSpeech 把新一轮的
+    // 待合成队列清空（id 不匹配 → ttsBuffers.clear()），且残余半句仍会被合成播出。
+    if (!controller.signal.aborted && activeLLM && activeLLM.id === id) {
+      for (const c of chunker.flush()) enqueueSpeech(id, c);
+    }
 
     if (result.stopReason === 'aborted') {
       log.info('[LLM] interrupted');
@@ -1108,8 +1126,13 @@ function announce(text) {
   broadcast({ type: 'llm_start', id });
   broadcast({ type: 'llm_done', fullText: text, id });
   const cached = prewarmPaths[text];
-  if (cached) {
-    // 预生成过的短句：直接播已合成的音频，省掉 1~2 秒合成延迟
+  if (cached && !SERVER_PLAYBACK) {
+    // 预生成短句目前只服务浏览器播放（缓存里只有文件路径，没有时长，也无从让 worker 直接播）：
+    // speakingUntil 用字数估算（中文约 4.5 字/秒，与 worker 侧估值一致），否则回声门控
+    // 会把喇叭/浏览器的播报当成用户说话；server|both|auto 时浏览器不播放，必须走下面的
+    // 正常管线，否则唤醒应答只上屏不出声。缓存因此暂不覆盖服务端放音。
+    const estMs = Math.round((text.length / 4.5) * 1000);
+    speakingUntil = Math.max(Date.now(), speakingUntil) + estMs + ECHO_TAIL_MS;
     broadcast({ type: 'tts_audio', audio_path: cached, text, id, play_mode: PLAYBACK_MODE });
   } else {
     enqueueSpeech(id, text);

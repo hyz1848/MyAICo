@@ -174,7 +174,7 @@ class Player:
     """
 
     def __init__(self, aec=None, samplerate=None, blocksize=BLOCK_SIZE,
-                 device=None, aec_rate=None):
+                 device=None, aec_rate=None, channels=None):
         dev = device if device is not None else (conf("tts.outputDevice") or None)
         if isinstance(dev, str):
             dev = dev.strip()
@@ -185,6 +185,7 @@ class Player:
         self.device = dev
         self.aec_rate = int(aec_rate or SAMPLE_RATE)
         self.sr = int(samplerate or conf_int("tts.outputRate", 0) or self._device_rate())
+        self.ch = int(channels or conf_int("tts.outputChannels", 0) or self._device_channels())
         self.bs = int(blocksize)
         self.aec = aec
         self._lock = threading.Lock()
@@ -201,9 +202,18 @@ class Player:
         except Exception:
             return 48000
 
+    def _device_channels(self):
+        """输出声道数：**不能**用 1 ✗（本机实测：单声道流在该端点打开成功但完全不出声 ✓）
+        → 用设备能力上限，通常 2；单声道内容在回调里复制到每个声道。"""
+        try:
+            n = int(sd.query_devices(self.device, kind='output')['max_output_channels'])
+            return max(1, min(2, n))
+        except Exception:
+            return 2
+
     def _ensure_stream(self):
         if self._stream is None:
-            self._stream = sd.OutputStream(samplerate=self.sr, channels=1, dtype="float32",
+            self._stream = sd.OutputStream(samplerate=self.sr, channels=self.ch, dtype="float32",
                                            blocksize=self.bs, device=self.device,
                                            callback=self._callback)
             self._stream.start()
@@ -211,7 +221,7 @@ class Player:
                 name = sd.query_devices(self.device, kind='output')['name']
             except Exception:
                 name = str(self.device)
-            print(f"[tts] 服务端放音已启动（{self.sr}Hz → {name[:38]}，"
+            print(f"[tts] 服务端放音已启动（{self.sr}Hz × {self.ch}声道 → {name[:34]}，"
                   f"AEC 参考 {self.aec_rate}Hz，AEC={'开' if self.aec else '关'}）",
                   file=sys.stderr, flush=True)
 
@@ -276,9 +286,17 @@ class Player:
                     refs.append(ref[r0:r1])
                 self._cur[3] = p + take
                 pos += take
-        outdata[:, 0] = buf
-        if self.aec is not None and refs:
-            self.aec.add_reference(refs[0] if len(refs) == 1 else np.concatenate(refs))
+        for c in range(outdata.shape[1]):
+            outdata[:, c] = buf
+        if self.aec is not None:
+            if refs:
+                self.aec.add_reference(refs[0] if len(refs) == 1 else np.concatenate(refs))
+            else:
+                # 空闲也喂参考：只喂播放样本会让参考时间轴停走，环形缓冲和麦克风时钟错位
+                # （下一段开始时取窗取到的是几秒前的位置）。空档期补等长零样本；
+                # 播放路径仍走上面的切片，保持零分配。
+                self.aec.add_reference(np.zeros(
+                    int(round(frames * self.aec_rate / float(self.sr))), dtype=np.float32))
 
 
 def push_block(arr):
@@ -1052,6 +1070,11 @@ def main():
                                                  taps=conf_int("aec.taps", 2048),
                                                  delay_samples=int(best[0]),
                                                  mu=conf_num("aec.mu", 0.4))
+                            # 重新挂到播放器上：Player 持有的是旧实例的引用，
+                            # 不重挂则麦克风走新消除器、播放回调仍喂旧实例（total_ref 恒为 0），
+                            # 新实例一直走"没播过东西"分支 → 本进程内再也不消除回声。
+                            if _player is not None:
+                                _player.aec = _aec
                             print(f"[aec] 就地标定并应用 delay={best[0]} 样本 "
                                   f"({best[0] / SAMPLE_RATE * 1000:.0f}ms) ERLE={best[1]:.1f}dB",
                                   file=sys.stderr, flush=True)

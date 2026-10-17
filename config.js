@@ -37,7 +37,7 @@ const DEFAULTS = {
   history: { compressAt: 160000, keepRecent: 12, maxMessages: 400 },
   kvWarm: { enabled: true, idleMs: 60000, keepMs: 1800000, minMessages: 2, tickMs: 10000 },
   tts: {
-    backend: 'piper', playback: 'server', provider: 'auto', piperDir: '', kokoroDir: '', kokoroProvider: 'cpu', kokoroVoice: 0, kokoroVoiceName: 'zf_001', kokoroSidecarPython: '', kokoroSidecarPath: '', voice: 'zh-CN-XiaoxiaoNeural', modelDir: '', outputDevice: '', outputRate: 0,
+    backend: 'piper', playback: 'server', provider: 'auto', piperDir: '', kokoroDir: '', kokoroProvider: 'cpu', kokoroVoice: 0, kokoroVoiceName: 'zf_001', kokoroSidecarPython: '', kokoroSidecarPath: '', voice: 'zh-CN-XiaoxiaoNeural', modelDir: '', outputDevice: '', outputRate: 0, outputChannels: 0,
     threads: 4, timeoutSec: 15, retries: 2, failLimit: 3, lookahead: 2,
   },
   aec: { enabled: true, taps: 2048 },
@@ -92,6 +92,7 @@ const ENV_MAP = {
   VOICEAI_KOKORO_SIDECAR_PATH: ['tts.kokoroSidecarPath', 'str'],
   VOICEAI_TTS_OUT_DEVICE: ['tts.outputDevice', 'str'],
   VOICEAI_TTS_OUT_RATE: ['tts.outputRate', 'int'],
+  VOICEAI_TTS_OUT_CH: ['tts.outputChannels', 'int'],
   VOICEAI_TTS_MODEL: ['tts.modelDir', 'str'],
   VOICEAI_TTS_THREADS: ['tts.threads', 'int'],
   VOICEAI_TTS_TIMEOUT: ['tts.timeoutSec', 'float'],

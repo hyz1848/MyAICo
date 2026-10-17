@@ -46,6 +46,7 @@ class EchoCanceller:
         self.w = np.zeros(self.taps, dtype=np.float32)  # 回声路径估计
 
         self.total_ref = 0
+        self._last_ref_total = -1     # 上次 process 时的参考总数：用于识别"播放空档"（见 process）
         self.adapted_blocks = 0
         self.frozen_blocks = 0
         self.last_erle_db = 0.0
@@ -82,6 +83,13 @@ class EchoCanceller:
         L = d.size
         if L == 0:
             return d
+        # 空闲判定：自上次 process 起参考缓冲没有写入新样本（TTS 分段之间的播放空隙），
+        # 此时 wp 冻结，却仍按"当前时刻"取窗 → 自适应对着错时间轴的旧回声学；
+        # 且静音块的 dot(e,e)=|y|²≠0 而 mic_energy=0，必然被误判成发散（实测每段间隙触发一次，
+        # 累计到 20 次就锁死自适应，ERLE 恒为 0）。没有新参考 → 直接透传，不学也不判发散。
+        if self.total_ref == self._last_ref_total:
+            return d.copy()
+        self._last_ref_total = self.total_ref
         if self.total_ref < self.taps + L:
             return d.copy()          # 还没播过东西，无可消除
 
@@ -93,15 +101,17 @@ class EchoCanceller:
         echo_energy = float(np.dot(y, y))
         mic_energy = float(np.dot(d, d))
 
-        # 保护：输出比输入还响 ⇒ 滤波器在放大（真机时延失配时典型）→ 重置 + 本帧透传
-        if float(np.dot(e, e)) > mic_energy * self.blowup_ratio + self.eps:
+        # 保护：输出比输入还响 ⇒ 滤波器在放大（真机时延失配时典型）→ 重置 + 本帧透传。
+        # 额外要求真实麦克风能量：mic 静音时（|y|²>0 而 |d|²=0）上式恒成立，
+        # 会把每个静音块都算成一次发散。
+        if (mic_energy > 1e-8 * L and
+                float(np.dot(e, e)) > mic_energy * self.blowup_ratio + self.eps):
             self.w[:] = 0.0
             self.blowups += 1
             self.last_erle_db = 0.0
-            if self.blowups == self.max_blowups:
-                self.adapt_disabled = True      # 反复发散：停止自适应，只做静音期透传
-            elif self.blowups % 5 == 0:
-                self.adapt_disabled = False     # 隔几次再试（时延/增益可能已变）
+            # 只在连续发散（中间没成功自适应过）时锁死；blowups 是"连续计数"，
+            # 之前一旦置 True 就再也回不来（w=0 ⇒ e==d ⇒ 永远不判发散 ⇒ 计数不涨）。
+            self.adapt_disabled = self.blowups >= self.max_blowups
             return d.copy()
         self.last_erle_db = 10.0 * np.log10((mic_energy + self.eps) / (float(np.dot(e, e)) + self.eps))
 
@@ -121,6 +131,7 @@ class EchoCanceller:
                 # grad[k] 对应 w[taps-1-k]（与 np.convolve 的索引方向相反），故翻转
                 self.w += (self.mu * grad[::-1] / (x_energy + self.eps)).astype(np.float32)
                 self.adapted_blocks += 1
+                self.blowups = 0        # 自适应成功 ⇒ 之前的不算"连续发散"，并解除锁死（adapt_disabled 由计数派生）
                 if not np.all(np.isfinite(self.w)) or float(np.dot(self.w, self.w)) > 1e4:
                     # 数值发散兜底：重置滤波器，宁可没消除也不要输出垃圾
                     self.w[:] = 0.0

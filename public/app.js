@@ -135,13 +135,15 @@
         break;
 
       case 'llm_done':
-        if (msg.id !== undefined && currentReplyId && msg.id !== currentReplyId) break;
+        // -1 是 stop_tts 设的哨兵（真值！），用 > 0 判断避免丢掉本轮自己的收尾
+        if (msg.id !== undefined && currentReplyId > 0 && msg.id !== currentReplyId) break;
         finalizeStream();
         updateInputHint('normal');
         break;
 
       case 'llm_interrupted':
-        if (msg.id !== undefined && currentReplyId && msg.id !== currentReplyId) break;   // 旧一轮的收尾，别动新一轮
+        // 同上：currentReplyId 为 -1（已被 stop_tts 清空）时也要收尾，否则动画光标永久闪烁
+        if (msg.id !== undefined && currentReplyId > 0 && msg.id !== currentReplyId) break;   // 旧一轮的收尾，别动新一轮
         currentReplyId = -1;
         finalizeStream();
         updateInputHint('normal');
@@ -194,9 +196,15 @@
         // browser=是；both=两边都放；auto=服务器照常放 ✓ 且**远程**浏览器也要放 ✓
         // （本地浏览器不播 ✗ 否则和服务器喇叭同屋双响）
         const mode = String(msg.play_mode || playbackMode || 'server').toLowerCase();
+        // worker.py 会把服务端没入队成功的块标成 played="browser"，必须优先兜底，
+        // 否则 play_mode=server 时浏览器也不播 → 两边都没声音
+        const played = String(msg.played || '').toLowerCase();
         const host = location.hostname;
         const isRemote = !(host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]' || host === '');
-        const browserPlays = mode === 'browser' || mode === 'both' || (mode === 'auto' && isRemote);
+        const browserPlays = mode === 'browser'
+          || mode === 'both'
+          || played === 'browser'                                  // 服务端没播成 → 浏览器兜底 ✓
+          || (mode === 'auto' && isRemote);
         if (!browserPlays) {
           noteServerPlayback(msg.text);
           break;
@@ -440,6 +448,7 @@ registerProcessor('pcm-capture', PcmCapture);
   let currentAudio = null;
   let playbackHeartbeat = null;
   let playbackToken = 0;
+  let autoplayBlockedNotified = false;   // 自动播放被拦截只提示一次，避免每块都刷屏
 
   // 块间停顿：由句子结束标点决定（标点已随文本送给 TTS，语调由 edge-tts 决定）
   const PUNCT_GAP = { '。': 260, '．': 260, '.': 260, '！': 380, '!': 380, '？': 380, '?': 380, '；': 160, ';': 160, '…': 300, '\n': 300 };
@@ -515,8 +524,20 @@ registerProcessor('pcm-capture', PcmCapture);
       currentAudio = null;
       setTimeout(() => { if (isPlayingAudio && token === playbackToken) playNext(); }, gap);
     };
-    currentAudio.onerror = () => { currentAudio = null; playNext(); };
-    currentAudio.play().catch(() => { currentAudio = null; playNext(); });
+    currentAudio.onerror = () => {
+      if (token !== playbackToken) return;   // 已被打断/换轮：这是旧元素的失败，别清掉正在播的那个
+      currentAudio = null; playNext();
+    };
+    currentAudio.play().catch((err) => {
+      if (token !== playbackToken) return;   // pause() 触发的中止（AbortError）在后续任务里到达，必须忽略
+      currentAudio = null;
+      // 自动播放策略拦截（无用户手势）：否则每块都被静默丢弃，用户完全听不到任何提示
+      if (err && err.name === 'NotAllowedError' && !autoplayBlockedNotified) {
+        autoplayBlockedNotified = true;
+        addNotice('浏览器拦截了自动播放：请点一下页面任意处');
+      }
+      playNext();
+    });
   }
 
   // ========== Event Handlers ==========
