@@ -22,7 +22,8 @@ import numpy as np
 
 class EchoCanceller:
     def __init__(self, sample_rate=16000, taps=2048, mu=0.4, eps=1e-8,
-                 ref_seconds=3.0, delay_samples=0, dtd_ratio=1.5, res_floor=0.15):
+                 ref_seconds=3.0, delay_samples=0, dtd_ratio=1.5, res_floor=0.15,
+                 blowup_ratio=1.5, max_blowups=20):
         self.sr = int(sample_rate)
         self.taps = int(taps)
         self.mu = float(mu)
@@ -32,6 +33,12 @@ class EchoCanceller:
         self.dtd_ratio = float(dtd_ratio)
         # 残留抑制下限（0.15 ≈ 最多再压 16dB，避免把近端也压没）
         self.res_floor = float(res_floor)
+        # 发散保护：输出能量超过输入的 blowup_ratio 倍，说明滤波器在放大而不是消除
+        # （真机时延失配/强相关参考会出现），此时立即重置并透传，绝不放垃圾进识别。
+        self.blowup_ratio = float(blowup_ratio)
+        self.max_blowups = int(max_blowups)
+        self.blowups = 0
+        self.adapt_disabled = False
 
         self.buf_size = max(self.taps * 2, int(ref_seconds * self.sr))
         self.buf = np.zeros(self.buf_size, dtype=np.float32)
@@ -85,6 +92,17 @@ class EchoCanceller:
 
         echo_energy = float(np.dot(y, y))
         mic_energy = float(np.dot(d, d))
+
+        # 保护：输出比输入还响 ⇒ 滤波器在放大（真机时延失配时典型）→ 重置 + 本帧透传
+        if float(np.dot(e, e)) > mic_energy * self.blowup_ratio + self.eps:
+            self.w[:] = 0.0
+            self.blowups += 1
+            self.last_erle_db = 0.0
+            if self.blowups == self.max_blowups:
+                self.adapt_disabled = True      # 反复发散：停止自适应，只做静音期透传
+            elif self.blowups % 5 == 0:
+                self.adapt_disabled = False     # 隔几次再试（时延/增益可能已变）
+            return d.copy()
         self.last_erle_db = 10.0 * np.log10((mic_energy + self.eps) / (float(np.dot(e, e)) + self.eps))
 
         x_energy = float(np.dot(x_seg, x_seg))
@@ -95,7 +113,7 @@ class EchoCanceller:
         ref_rms = float(np.sqrt(x_energy / max(1, x_seg.size)))
         mic_rms = float(np.sqrt(mic_energy / max(1, L)))
         double_talk = can_adapt and mic_rms > self.dtd_ratio * ref_rms
-        if double_talk:
+        if double_talk or self.adapt_disabled:
             self.frozen_blocks += 1
         elif adapt and can_adapt:
             grad = np.correlate(x_seg, e, mode='valid')     # 长度 == taps
@@ -103,7 +121,7 @@ class EchoCanceller:
                 # grad[k] 对应 w[taps-1-k]（与 np.convolve 的索引方向相反），故翻转
                 self.w += (self.mu * grad[::-1] / (x_energy + self.eps)).astype(np.float32)
                 self.adapted_blocks += 1
-                if not np.all(np.isfinite(self.w)) or float(np.dot(self.w, self.w)) > 1e6:
+                if not np.all(np.isfinite(self.w)) or float(np.dot(self.w, self.w)) > 1e4:
                     # 数值发散兜底：重置滤波器，宁可没消除也不要输出垃圾
                     self.w[:] = 0.0
                     self.frozen_blocks += 1
@@ -128,6 +146,9 @@ class EchoCanceller:
             "frozen_blocks": self.frozen_blocks,
             "erle_db": round(float(self.last_erle_db), 1),
             "w_energy": float(np.dot(self.w, self.w)),
+            "blowups": self.blowups,
+            "adapt_disabled": self.adapt_disabled,
+            "delay_samples": self.delay_samples,
         }
 
 

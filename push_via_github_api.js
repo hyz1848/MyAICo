@@ -138,12 +138,11 @@ async function pushViaApi(token, opts = {}) {
     : `⚠️  tree 哈希不同（本地 ${localTree}）：内容可能有差异（换行符/模式），请核对`);
   console.log(`远端 commit: ${commitSha}`);
 
-  // 6) 记录远端跟踪引用，便于本地与远端对齐（不需要网络）
-  const refFile = path.join(__dirname, '.git', 'refs', 'remotes', 'origin', BRANCH);
-  fs.mkdirSync(path.dirname(refFile), { recursive: true });
-  fs.writeFileSync(refFile, commitSha + '\n');
-  console.log(`已写入本地跟踪引用 .git/refs/remotes/origin/${BRANCH} → ${commitSha.slice(0, 8)}`);
-  console.log(`\n下一步（本地对齐，无需网络）：\n  git reset --mixed ${commitSha}\n  git branch --set-upstream-to=origin/${BRANCH} ${BRANCH}`);
+  // 6) 不再写 .git/refs/remotes/origin/<branch>：
+  //    那个对象在本地不存在（github.com 不通时 fetch 不到），写了会让 git 报
+  //    "does not point to a valid object"（连自动 gc 都失败）。等网络通了 fetch 即可。
+  console.log('\n推送完成。待 github.com 可达时对齐本地与远端：');
+  console.log(`  git fetch origin && git reset --mixed origin/${BRANCH}`);
   return { commitSha, treeSha, treeMatches };
 }
 

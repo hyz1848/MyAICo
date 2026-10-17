@@ -204,6 +204,66 @@ LLM 默认 `http://192.168.3.166:1234`（`LLM_BASE_URL`/`LLM_MODEL` 可覆盖）
 **新调试通道**：`conf.json` 的 `debug.asrSim=true` 时，可发 `{type:'asr_sim', text:'...'}` 注入一条"识别结果"，
 走与真实 ASR 完全相同的下行处理（门控/停止词/回声判定都真实生效），便于复现这类问题。
 
+## 服务端放音 + AEC：现状与诚实结论
+**已实现**：放音与采集同进程（`Player` sounddevice 输出流 ✓，回调把**输出样本**喂给 AEC 作参考 ✓）+
+就地标定（`{cmd:'aec_calibrate'}` / WS `{type:'aec_calibrate'}` ✓：用真实管线放一段噪声、按 ERLE
+扫描延迟并**立即应用**）+ 发散保护（参考失配时**宁可透传也不放大** ✓）。
+
+**实测（要说清）**：
+- 离线假房间（`test_playback_aec.py`）：**ERLE 12.2dB** ✓，时延失配时最大放大仅 1.35× ✓（保护有效 ✓）
+- 真机就地标定：最佳 `delay=7520 样本(470ms)`，**ERLE 只有 5.4dB** ✓
+- 真机放音期间采样：**ERLE 0dB** ✗ —— 多数时候仍走"发散保护→透传"（即**没在消回声** ✗）
+- 但整机**不会自听转写** ✓（多次实测无一条自听 ASR ✓）—— 这靠的是：
+  播报期能量门限 ×1.8 + 内容级回声比对（`echo-guard.js`）+ 停止词，而不是 AEC
+
+**结论**：AEC 属于"尽力而为"组件 ✓（链路/标定/保护都齐 ✓，但真机抑制效果不稳 ✗）。
+要真做好还得做**延迟漂移跟踪**（两条独立流时钟漂移 ✓）、双讲调参、更多 taps —— 是深水区 ✗。
+可用 `aec.enabled=false` 关掉（省点 CPU，行为不变 ✓，因为兜底本来就在生效 ✓）。
+
+## GPU 版 Kokoro（中英双语 TTS）与独立 venv-gpu
+**为什么**：Kokoro 多语言模型（中英同模型 ✓）在 **DirectML 上会崩进程** ✗（动态 shape 图，退出码 5；
+试过 sequential / 关 mem-pattern 都不行），但走 **ROCm PyTorch** 可以吃上 9070 XT。
+
+**关键实现**（`tts_kokoro_gpu.py` + `tts_kokoro.py`）：
+- 音素化**不用 misaki**（会拖 spacy/num2words 一整条链 ✗）：复用 `tts_kokoro.py` 里查表实现
+  （`lexicon-zh.txt` 汉字→注音、`lexicon-us-en.txt` 英文词→IPA、`tokens.txt` 音素→id，
+  多字词条最长匹配解决多音字）——**与 PyTorch 版权重词表 171/171 完全一致**（实测校验 ✓），
+  与 ONNX 版共享同一套音素化 ✓
+- `kokoro/__init__` 会连带导入 `KPipeline`（依赖 misaki）→ 用**宽容桩模块**绕开（`stub_misaki()`）
+- 音色：`voices/*.pt` 形状是 **`[510, 1, 256]`**，取 `[idx]`（idx = min(token 数, 509)）得到 `[1,256]`
+  **直接传模型，不要再 unsqueeze**（多一层就是 `[1,0,256]` 报错）
+
+**GPU 环境：`H:\voiceai\venv-gpu`（独立，不共用 OCR venv）**
+搭建：`python setup_gpu_venv.py`（从本机已有的 ROCm venv 复制，比下载快得多；HF 本机不通 ✗）
+它处理了这些坑：
+- ROCm 运行时在**下划线包**里：`_rocm_sdk_core`、`_rocm_sdk_libraries_custom`（共 ~3.4GB），
+  不在 `rocm_sdk*`；少了报 `rocm_sdk ... UnboundLocalError`
+- **dist-info 必须与包一起拷**，且**先删掉 pip 装的那份**（两份并存会读到错的版本 ✗）
+- `transformers 5.15.0` 要求 `huggingface-hub>=1.5,<2` 与 `tokenizers<=0.23.0`，而 PyPI 上只有更新的 ✗
+  → 必须用 OCR venv 里那套（hf_hub 1.27.0 / tokenizers 0.22.2）
+- `kokoro` 需要 `attrs`/`colorama`/`truststore`/`httpx2`/`httpcore2`/`hf_xet`（PyPI 上部分不存在 ✗）
+
+**实测结论：GPU 版 Kokoro 比 CPU 还慢 ✗，故默认不用它**
+| 路径 | RTF | 说明 |
+|---|---|---|
+| **Piper + DirectML（默认）** | **0.02~0.09** ✓✓ | 220~520ms/句 |
+| Kokoro + CPU/ONNX | 0.91~1.06 | 中英双语，可用但偏慢 |
+| Kokoro + ROCm GPU | **1.506** ✗ | 更慢：MIOpen 对该模型只走通用 GEMM 兜底（日志 `GemmFwdRest` workspace 警告） |
+`tts.kokoroUseGpu=true` 才走 GPU sidecar（需 venv-gpu，约 6GB）。
+
+**这一轮修掉的三个真 bug（都记下来）**：
+1. **我误设 `MIOPEN_FIND_MODE`/`MIOPEN_FIND_ENFORCE`** → MIOpen 解析失败报 `invalid stoul argument` ✗；
+   去掉就正常。**教训：不要乱加 MIOPEN_* 环境变量**（用户环境不设它们时 OCR/MIOpen 一切正常 ✓）
+2. **`KModel.forward()` 收的是"音素字符串"** ✗（传 id tensor 会被 `vocab.get()` 全部过滤成空序列 ✗
+   → 只输出 0.375s 垃圾 ✗）。正确：`forward_with_tokens(torch.LongTensor([[0,*ids,0]]), ref, speed)`
+   （**首尾各补一个 0** 作为 BOS/EOS ✓）
+3. **dropout**：配置里 `plbert.dropout=0.1`（ALBERT 注意力在 **C++ 层**调 dropout，Python 侧替换
+   `F.dropout` 盖不住 ✗）→ 在**构造模型前**把 config 的 dropout 置 0 ✓ 即可（推理期本就是恒等 ✓）
+
+**实测**：KModel→GPU 加载 ~1.0s、显存 ~613MB；GPU fp32 约 1.2 TFLOPS。
+**调用**：worker 以**常驻 sidecar** 方式跑（`tts_kokoro_gpu.py --server`，JSON 行协议），
+模型只加载一次；`tts.backend=kokoro` 时有 GPU 就用 GPU，否则回退 ONNX/CPU 路径 ✓
+
 ## 唤醒延迟（实测 1043ms）
 优化前后：`说完 → 听到应答` 由 **3~4 秒** 降到 **~1.2 秒**。
 
@@ -336,7 +396,11 @@ LLM 默认 `http://192.168.3.166:1234`（`LLM_BASE_URL`/`LLM_MODEL` 可覆盖）
 | `node test_payload.js` | 真实请求体核对（KV 前缀稳定性/思维链开关，9 项） |
 | `node test_kv_warm.js` | **KV 保温算法 A/B**（自建模拟服务端，16 项，不需要真实 LLM） |
 | `node test_kv_prefix.js` | 真实服务上的消息布局审计：逐轮只追加 + 缓存命中率（需 `--set=VOICEAI_LLM_DUMP=...` 启动服务） |
-| `python test_tts_piper_gpu.py` | **GPU TTS 验收**：piper-gpu vs edge 的延迟/RTF/ASR 回读 + 试听文件 |
+| `python test_tts_piper_gpu.py` | **Piper GPU 验收**：piper-gpu vs edge 的延迟/RTF/ASR 回读 |
+| `python test_tts_all.py [--voices]` | **三后端对比**：piper(GPU) / kokoro(CPU/GPU) / edge + ASR 回读 |
+| `python test_playback_aec.py` | 服务端放音 + AEC（含时延失配保护回归，13 项） |
+| `python calibrate_aec.py [--write]` | 实测播放→麦克风往返延迟（按 ERLE 扫描）并写入 conf |
+| `python setup_gpu_venv.py` | 从已有 ROCm venv 复制出独立 GPU 环境（venv-gpu） |
 | `python test_tts_backends.py` | Kokoro(sherpa) vs edge 对比（含中英混/英文） |
 
 ## 关键机制

@@ -14,6 +14,7 @@
   let audioQueue = [];
   let isPlayingAudio = false;
   let currentReplyId = 0;
+  let playbackMode = 'server';   // server = Python 端放音（浏览器只显示）
   let streamEl = null;   // 本轮流式回复的气泡元素
 
   // ========== DOM Elements ==========
@@ -68,6 +69,13 @@
     };
   }
 
+  /** 服务端放音：浏览器只显示（别再放一遍），用状态提示表示正在播报 */
+  function noteServerPlayback(text) {
+    console.debug('[TTS] 由服务端播报:', text);
+    document.body.classList.add('server-speaking');
+    updateInputHint('speaking');
+  }
+
   function handleServerMessage(msg) {
     switch (msg.type) {
       case 'wake_state':
@@ -76,6 +84,7 @@
         break;
 
       case 'hello':
+        if (msg.playback) playbackMode = msg.playback;
         captureMode = captureModeOverride || msg.capture || 'server';
         frameSamples = msg.frameSamples || 1280;
         wakeWord = msg.wakeWord || wakeWord;
@@ -115,6 +124,7 @@
 
       case 'stop_tts':
         currentReplyId = -1;   // 打断后，仍在途的同 id 音频一律丢弃
+        document.body.classList.remove('server-speaking');
         stopPlayback();
         break;
 
@@ -167,8 +177,24 @@
         dropQueuedAudio();
         break;
 
+      case 'playback_start':
+        // 服务端放音（Python 端播给声卡）：用状态提示表示正在说话
+        document.body.classList.add('server-speaking');
+        updateInputHint('speaking');
+        break;
+
+      case 'playback_end':
+        document.body.classList.remove('server-speaking');
+        updateInputHint('normal');
+        break;
+
       case 'tts_audio':
         if (msg.id !== undefined && currentReplyId && msg.id !== currentReplyId) break;
+        // 服务端放音：音频已由 Python 端播给声卡了，浏览器只显示文字，别再放一遍（否则双重出声）
+        if ((msg.played || playbackMode) === 'server') {
+          noteServerPlayback(msg.text);
+          break;
+        }
         playAudio(msg.audioPath || msg.audio_path, msg.text);
         break;
 

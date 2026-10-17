@@ -128,6 +128,114 @@ _empty_dump_idx = 0       # 空识别结果音频的循环存盘序号（诊断�
 _stream = None
 
 
+# ========== 服务端放音 + AEC ==========
+# 为什么必须同进程：AEC 的参考信号 = 我们喂给声卡的样本，要与麦克风严格同源同时间轴。
+# 浏览器放音时参考信号在浏览器里，Python 侧拿不到 → 只能靠能量门限/内容比对硬扛（就是之前的状态）。
+TTS_PLAYBACK = cenv("VOICEAI_PLAYBACK", "tts.playback", "server", str).lower()   # server | browser
+AEC_ENABLED = conf_bool("aec.enabled", True) and TTS_PLAYBACK == "server"
+
+_aec = None
+if AEC_ENABLED:
+    try:
+        from aec import EchoCanceller
+        _aec = EchoCanceller(sample_rate=SAMPLE_RATE,
+                             taps=conf_int("aec.taps", 2048),
+                             delay_samples=conf_int("aec.delaySamples", 0),
+                             mu=conf_num("aec.mu", 0.4))
+        print(f"[aec] 已启用 taps={conf_int('aec.taps', 2048)} "
+              f"delay={conf_int('aec.delaySamples', 0)} 样本 mu={conf_num('aec.mu', 0.4)}",
+              file=sys.stderr, flush=True)
+    except Exception as _e:
+        print(f"[aec] 初始化失败，退回无 AEC: {_e}", file=sys.stderr, flush=True)
+
+_player = None
+_aec_report = type('R', (), {})()
+
+
+class Player:
+    """服务端放音（sounddevice 输出流）。回调里把输出样本喂给 AEC 作为参考信号。"""
+
+    def __init__(self, aec=None, samplerate=SAMPLE_RATE, blocksize=BLOCK_SIZE):
+        self.sr = int(samplerate)
+        self.bs = int(blocksize)
+        self.aec = aec
+        self._lock = threading.Lock()
+        self._items = deque()          # 待播 [(id, np.float32 一维)]
+        self._cur = None               # [id, arr, pos]
+        self._stream = None
+        self._events = queue.Queue()   # 回调线程投递，交给上报线程发（回调里不能阻塞写 stdout）
+        self.playing_id = None
+        self.dropped = 0               # 中断丢弃的段数（诊断用）
+
+    def _ensure_stream(self):
+        if self._stream is None:
+            self._stream = sd.OutputStream(samplerate=self.sr, channels=1, dtype="float32",
+                                           blocksize=self.bs, callback=self._callback)
+            self._stream.start()
+            print(f"[tts] 服务端放音已启动（{self.sr}Hz，AEC={'开' if self.aec else '关'}）",
+                  file=sys.stderr, flush=True)
+
+    def enqueue(self, path, item_id=None):
+        data, sr = sf.read(path, dtype="float32")
+        if data.ndim > 1:
+            data = data.mean(axis=1)
+        if sr != self.sr:      # TTS 多为 22.05k/24k，重采样到采集率（线性插值够用，且要与麦克风时间轴一致）
+            n = max(1, int(round(len(data) * self.sr / float(sr))))
+            idx = np.linspace(0, len(data) - 1, n, dtype=np.float64)
+            data = np.interp(idx, np.arange(len(data), dtype=np.float64), data).astype(np.float32)
+        with self._lock:
+            self._items.append((item_id, data))
+        self._ensure_stream()
+
+    def stop(self):
+        """立即停（打断用）：清当前段与待播队列"""
+        with self._lock:
+            dropped = (1 if self._cur else 0) + len(self._items)
+            self._items.clear()
+            self._cur = None
+            self.playing_id = None
+        self.dropped += dropped
+        return dropped
+
+    def is_playing(self):
+        with self._lock:
+            return self._cur is not None or len(self._items) > 0
+
+    def drain_events(self):
+        out_ev = []
+        while True:
+            try:
+                out_ev.append(self._events.get_nowait())
+            except queue.Empty:
+                return out_ev
+
+    def _callback(self, outdata, frames, time_info, status):
+        buf = np.zeros(frames, dtype=np.float32)
+        pos = 0
+        with self._lock:
+            while pos < frames:
+                if self._cur is None:
+                    if not self._items:
+                        break
+                    item_id, arr = self._items.popleft()
+                    self._cur = [item_id, arr, 0]
+                    self.playing_id = item_id
+                    self._events.put(("start", item_id, len(arr) / float(self.sr)))
+                item_id, arr, p = self._cur
+                take = min(frames - pos, len(arr) - p)
+                if take <= 0:
+                    self._events.put(("end", item_id, None))
+                    self._cur = None
+                    self.playing_id = None
+                    continue
+                buf[pos:pos + take] = arr[p:p + take]
+                self._cur[2] = p + take
+                pos += take
+        outdata[:, 0] = buf
+        if self.aec is not None:
+            self.aec.add_reference(buf)     # 参考信号 = 真正喂给声卡的样本
+
+
 def push_block(arr):
     """把一帧 float32 音频放进 VAD 队列；队列过长时丢最老的，避免慢消费者积压"""
     while _block_queue.qsize() >= 400:   # ~32s 缓冲：识别线程短暂占用也不会顶掉新音频
@@ -146,9 +254,14 @@ def out(obj):
 
 # ========== Audio ==========
 def audio_callback(indata, frames, time_info, status):
+    # 采集侧回声消除：先用 AEC 减去估计回声，再做 VAD/识别。
+    # 参考信号由 Player 的播放回调提供（同进程、同时间轴），这是能真正消回声的前提。
+    block = np.asarray(indata[:, 0], dtype=np.float32) if indata.ndim > 1 else np.asarray(indata, dtype=np.float32)
+    if _aec is not None:
+        block = _aec.process(block)
     if _listen_active:
-        push_block(indata.copy())
-    rms = float(np.sqrt(np.mean(indata * indata)))
+        push_block(block)
+    rms = float(np.sqrt(np.mean(block * block)))
     try:
         _level_queue.put_nowait(round(rms, 4))
     except queue.Empty:
@@ -278,16 +391,19 @@ def transcribe(audio_data):
 # ========== TTS: 本地(sherpa-onnx/Kokoro) 优先，edge-tts 兜底 ==========
 SYNTH_TIMEOUT = cenv("VOICEAI_TTS_TIMEOUT", "tts.timeoutSec", 15, float)
 SYNTH_RETRIES = cenv("VOICEAI_TTS_RETRIES", "tts.retries", 2, int)
-TTS_BACKEND = cenv("VOICEAI_TTS", "tts.backend", "piper", str).lower()   # piper | sherpa | edge
+TTS_BACKEND = cenv("VOICEAI_TTS", "tts.backend", "piper", str).lower()   # piper | kokoro | sherpa | edge
 # 兜底顺序按实测速度/可用性排：首选之后依次 piper → edge → sherpa。
 # sherpa(Kokoro) 在 CPU 上 RTF 1.5（比实时慢、跟不上播放），只作最后手段；
 # edge 是网络合成但要 1.2s/句、质量稳，排在 piper 之后。
-TTS_ORDER = [TTS_BACKEND] + [b for b in ("piper", "edge", "sherpa") if b != TTS_BACKEND]
+TTS_ORDER = [TTS_BACKEND] + [b for b in ("piper", "edge", "sherpa", "kokoro") if b != TTS_BACKEND]
 _local_tts = None
 _local_fails = 0            # 本地连续失败次数
 _local_disabled = False     # 连续失败达上限后本次进程内不再尝试本地
 _missing_logged = False     # "模型未就绪"只提示一次，避免每句刷屏
 _piper_tts = None
+_kokoro_tts = None
+_kokoro_gpu = None        # 常驻 sidecar 进程（独立 venv-gpu 里的 ROCm torch）
+_kokoro_gpu_lock = None
 _piper_fails = 0
 _piper_disabled = False
 _piper_missing_logged = False
@@ -330,6 +446,91 @@ def synth_piper(text, voice=None):
     print(f"[tts] Piper 合成 {len(text)}字 ({(time.time() - t0) * 1000:.0f}ms, "
           f"{tt.provider_used}, 音频 {dur:.2f}s)", file=sys.stderr, flush=True)
     return path
+
+
+def _get_kokoro():
+    """Kokoro（中英双语）。实测：CPU RTF 0.8~0.9；**DirectML 会崩**（动态 shape 图），故默认 cpu"""
+    global _kokoro_tts
+    if _kokoro_tts is None:
+        from tts_kokoro import KokoroTts
+        _kokoro_tts = KokoroTts(model_dir=conf("tts.kokoroDir") or None,
+                                provider=conf("tts.kokoroProvider", "cpu"),
+                                voice=conf_int("tts.kokoroVoice", 0),
+                                threads=cenv("VOICEAI_TTS_THREADS", "tts.threads", 4, int))
+        print(f"[tts] Kokoro 模型目录: {_kokoro_tts.model_dir} 可用={_kokoro_tts.available()}",
+              file=sys.stderr, flush=True)
+    return _kokoro_tts
+
+
+def synth_kokoro(text, voice=None):
+    from tts_kokoro import KokoroUnavailable
+    t = _get_kokoro()
+    if not t.available():
+        raise KokoroUnavailable(f"Kokoro 模型缺失: {t.model_dir}")
+    t0 = time.time()
+    out = os.path.join(TMP_DIR, f"tts_{uuid.uuid4().hex}.wav")
+    path, dur = t.synthesize(text, out)
+    print(f"[tts] Kokoro 合成 {len(text)}字 ({(time.time() - t0) * 1000:.0f}ms, "
+          f"{t.provider_used}, 音频 {dur:.2f}s)", file=sys.stderr, flush=True)
+    return path
+
+
+def kokoro_gpu_python():
+    """GPU 版 Kokoro 用的解释器：优先配置，其次项目内 venv-gpu"""
+    p = conf("tts.kokoroGpuPython") or os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                   "venv-gpu", "Scripts", "python.exe")
+    return p if os.path.exists(p) else None
+
+
+def _kokoro_gpu_proc():
+    """懒启动常驻 sidecar（模型只加载一次；每句重载模型会白等 1~2 秒）"""
+    global _kokoro_gpu, _kokoro_gpu_lock
+    import subprocess
+    if _kokoro_gpu_lock is None:
+        _kokoro_gpu_lock = threading.Lock()
+    with _kokoro_gpu_lock:
+        if _kokoro_gpu is not None and _kokoro_gpu.poll() is None:
+            return _kokoro_gpu
+        py = kokoro_gpu_python()
+        if not py:
+            return None
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tts_kokoro_gpu.py")
+        env = dict(os.environ)
+        # ROCm 运行时若在外部 SDK 里，补进 PATH（torch 轮子通常自带，缺了才需要）
+        rocm_bin = os.path.join(os.environ.get("HIP_PATH", r"D:\Program Files\AMD\ROCm"), "bin")
+        if os.path.isdir(rocm_bin) and rocm_bin not in env.get("PATH", ""):
+            env["PATH"] = rocm_bin + os.pathsep + env.get("PATH", "")
+        _kokoro_gpu = subprocess.Popen([py, script, "--server"], stdin=subprocess.PIPE,
+                                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                       text=True, encoding="utf-8", bufsize=1, env=env)
+        line = _kokoro_gpu.stdout.readline()      # 等 ready
+        if not line:
+            raise RuntimeError("Kokoro GPU sidecar 启动失败")
+        print(f"[tts] Kokoro-GPU sidecar 就绪: {line.strip()}", file=sys.stderr, flush=True)
+        return _kokoro_gpu
+
+
+def synth_kokoro_gpu(text, voice=None):
+    """GPU 合成（独立 venv-gpu 里的 ROCm torch，走常驻 sidecar）"""
+    import json
+    proc = _kokoro_gpu_proc()
+    if proc is None:
+        raise RuntimeError("未找到 GPU 解释器（venv-gpu/Scripts/python.exe）")
+    out = os.path.join(TMP_DIR, f"tts_{uuid.uuid4().hex}.wav")
+    vname = voice if (voice and not voice.startswith("zh-CN")) else conf("tts.kokoroVoiceName", "zf_001")
+    req = json.dumps({"text": text, "out": out, "voice": vname}, ensure_ascii=False)
+    with _kokoro_gpu_lock:
+        proc.stdin.write(req + "\n")
+        proc.stdin.flush()
+        line = proc.stdout.readline()
+    if not line:
+        raise RuntimeError("Kokoro GPU sidecar 无响应")
+    r = json.loads(line)
+    if not r.get("ok"):
+        raise RuntimeError(r.get("error", "未知错误"))
+    print(f"[tts] Kokoro-GPU 合成 {len(text)}字 ({r.get('ms')}ms, 音频 {r.get('dur')}s, "
+          f"显存 {r.get('vram')}MB, 音色 {vname})", file=sys.stderr, flush=True)
+    return r["path"]
 
 
 def _get_local_tts():
@@ -405,6 +606,16 @@ def synthesize(text, voice="zh-CN-XiaoxiaoNeural"):
                 p = synth_piper(text, voice)
                 if p:
                     return p, "piper"
+            elif backend == "kokoro":
+                # GPU 版 Kokoro 实测 RTF 1.5（比 CPU 的 0.9 还慢 ✗：MIOpen 对这个小模型
+                # 只走通用 GEMM 兜底）→ 默认走 CPU/ONNX；要用 GPU 需显式开 tts.kokoroUseGpu
+                if conf_bool("tts.kokoroUseGpu", False) and kokoro_gpu_python():
+                    p = synth_kokoro_gpu(text, voice)
+                    if p:
+                        return p, "kokoro-gpu"
+                p = synth_kokoro(text, voice)
+                if p:
+                    return p, "kokoro"
             elif backend == "sherpa":
                 if _local_disabled:
                     continue
@@ -536,6 +747,8 @@ def stdin_reader():
 
 
 def level_sender():
+    """电平上报 + 服务端放音状态同步（回调线程不能直接写 stdout，所以在这里发）"""
+    global _playback_active, _playback_since, _playback_off_at
     last = 0.0
     while True:
         try:
@@ -543,14 +756,46 @@ def level_sender():
         except queue.Empty:
             continue
         now = time.time()
+
+        # 服务端放音：把状态同步给 VAD 门控（等价于浏览器模式下的 playback on/off）
+        if _player is not None:
+            for ev in _player.drain_events():
+                kind, item_id, dur = ev
+                out({"type": "playback_" + kind, "id": item_id, "duration": dur})
+            playing = _player.is_playing()
+            if playing and not _playback_active:
+                _playback_active = True
+                _playback_since = now
+                drain_blocks()          # 播放开始：清掉队列里可能混入的回声残留
+            elif not playing and _playback_active:
+                _playback_active = False
+                _playback_off_at = now
+
         if now - last >= 0.1:
-            out({"type": "audio_level", "level": level})
+            msg = {"type": "audio_level", "level": level}
+            if _aec is not None and not hasattr(_aec_report, 'last') or (
+                    _aec is not None and now - getattr(_aec_report, 'last', 0) >= 2.0):
+                _aec_report.last = now
+                st = _aec.stats()
+                msg["aec"] = {"erle": st["erle_db"], "blowups": st["blowups"],
+                              "adapted": st["adapted_blocks"], "frozen": st["frozen_blocks"]}
+                if st["blowups"]:
+                    print(f"[aec] ERLE={st['erle_db']}dB 发散重置={st['blowups']} 次 "
+                          f"自适应={st['adapted_blocks']} 冻结={st['frozen_blocks']}",
+                          file=sys.stderr, flush=True)
+            if _player is not None:
+                msg["playing"] = _player.is_playing()
+                msg["playing_id"] = _player.playing_id
+            out(msg)
             last = now
 
 
 # ========== Main Loop ==========
 def main():
-    global _listen_active, _playback_active, _playback_since, _playback_off_at, _feed_mode, _stream
+    global _listen_active, _playback_active, _playback_since, _playback_off_at, _feed_mode, _stream, _player, _aec
+
+    if TTS_PLAYBACK == "server":
+        _player = Player(aec=_aec)
 
     print(f"[conf] {CONF_PATH} | TTS={TTS_BACKEND} 语音窗={SILENCE_MS}ms 门限={VAD_ENERGY_MIN}x{VAD_MULT} "
           f"ASR={conf('asr.model', 'paraformer-zh')}", file=sys.stderr, flush=True)
@@ -606,6 +851,11 @@ def main():
                         _playback_off_at = time.time()
 
             elif action == "clear":
+                # 打断：停掉正在播的音 + 丢掉待播段（服务端放音时这是"立刻闭嘴"的关键）
+                if _player is not None:
+                    dropped = _player.stop()
+                    if dropped:
+                        print(f"[tts] 打断播放：丢弃 {dropped} 段", file=sys.stderr, flush=True)
                 # Interrupt: drop pending tts commands still queued for synthesis
                 kept = queue.Queue()
                 while True:
@@ -632,8 +882,16 @@ def main():
                         duration = float(sf.info(audio_path).duration)
                     except Exception:
                         duration = len(text) / 4.5   # 估个大概：中文约 4.5 字/秒
+                    played = "browser"
+                    if TTS_PLAYBACK == "server" and _player is not None:
+                        try:
+                            _player.enqueue(audio_path, rid)
+                            played = "server"
+                        except Exception as pe:
+                            print(f"[tts] 服务端放音入队失败，改由浏览器播放: {pe}",
+                                  file=sys.stderr, flush=True)
                     out({"type": "tts_audio", "audio_path": audio_path, "text": text, "id": rid,
-                         "backend": backend, "duration": round(duration, 2)})
+                         "backend": backend, "duration": round(duration, 2), "played": played})
 
             elif action == "prewarm_tts":
                 # 预生成常用短语音（唤醒应答等），避免每次现合成带来的 1~2 秒延迟
@@ -647,6 +905,82 @@ def main():
                     except Exception as e:
                         print(f"[prewarm] 失败: {e}", file=sys.stderr, flush=True)
 
+            elif action == "aec_calibrate":
+                # 就地标定：用**生产中的**输出/采集流测播放→麦克风往返延迟，
+                # 按 ERLE 扫最佳 delay（跨进程标定会因流启动时序不同而失配，实测踩过）
+                if _aec is None:
+                    out({"type": "error", "error": "AEC 未启用（tts.playback 需为 server）"})
+                else:
+                    try:
+                        from aec import EchoCanceller
+                        import soundfile as _sf
+                        rng2 = np.random.default_rng(11)
+                        burst = (0.35 * rng2.standard_normal(SAMPLE_RATE)).astype(np.float32)
+                        cal = os.path.join(TMP_DIR, "aec_cal.wav")
+                        _sf.write(cal, burst, SAMPLE_RATE)
+                        rec = np.zeros(SAMPLE_RATE * 2, dtype=np.float32)
+                        pos = {"n": 0}
+
+                        def _cal_cb(indata, frames, ti, st):
+                            n = pos["n"]
+                            blk = indata[:, 0] if indata.ndim > 1 else indata
+                            if n + frames <= rec.size:
+                                rec[n:n + frames] = blk
+                            pos["n"] = n + frames
+
+                        st = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                                            blocksize=BLOCK_SIZE, callback=_cal_cb)
+                        st.start()
+                        time.sleep(0.3)
+                        _player.enqueue(cal, "cal")
+                        time.sleep(1.4)
+                        _player.stop()
+                        time.sleep(0.4)
+                        st.stop(); st.close()
+
+                        n = len(rec)
+                        ref = np.zeros(n, dtype=np.float32)
+                        ref[int(SAMPLE_RATE * 0.3):int(SAMPLE_RATE * 0.3) + len(burst)] = burst
+                        best = (0, -99.0)
+                        table = []
+                        for delay in range(0, 14000, 160):
+                            a = EchoCanceller(sample_rate=SAMPLE_RATE, taps=conf_int("aec.taps", 2048),
+                                              delay_samples=delay)
+                            w0 = int(SAMPLE_RATE * 0.3) + delay
+                            w1 = w0 + len(burst)
+                            if w0 + BLOCK_SIZE * 4 >= n:
+                                continue
+                            m0 = w0 + int((w1 - w0) * 0.45)
+                            me, oe = [], []
+                            for b in range((n - BLOCK_SIZE) // BLOCK_SIZE):
+                                i = b * BLOCK_SIZE
+                                a.add_reference(ref[i:i + BLOCK_SIZE])
+                                o = a.process(rec[i:i + BLOCK_SIZE].copy())
+                                if m0 <= i < min(w1, n):
+                                    me.append(float(np.mean(rec[i:i + BLOCK_SIZE] ** 2)))
+                                    oe.append(float(np.mean(o ** 2)))
+                            if len(me) < 3:
+                                continue
+                            erle = 10 * np.log10(max(np.mean(me), 1e-15) / max(np.mean(oe), 1e-15))
+                            table.append((delay, round(erle, 1)))
+                            if erle > best[1]:
+                                best = (delay, erle)
+                        table.sort(key=lambda x: -x[1])
+                        # 应用：用最佳延迟重建 AEC（跨进程标定会失配，就地标定才准）
+                        if best[1] > 2.0:
+                            _aec = EchoCanceller(sample_rate=SAMPLE_RATE,
+                                                 taps=conf_int("aec.taps", 2048),
+                                                 delay_samples=int(best[0]),
+                                                 mu=conf_num("aec.mu", 0.4))
+                            print(f"[aec] 就地标定并应用 delay={best[0]} 样本 "
+                                  f"({best[0] / SAMPLE_RATE * 1000:.0f}ms) ERLE={best[1]:.1f}dB",
+                                  file=sys.stderr, flush=True)
+                        out({"type": "aec_calibrated", "delay": best[0],
+                             "erle": round(best[1], 1), "applied": best[1] > 2.0,
+                             "top": table[:5]})
+                    except Exception as ce:
+                        out({"type": "error", "error": f"标定失败: {ce}"})
+
             elif action == "ping":
                 out({"type": "pong"})
 
@@ -659,4 +993,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        if _kokoro_gpu is not None:
+            try:
+                _kokoro_gpu.stdin.write(json.dumps({"cmd": "quit"}) + "\n")
+                _kokoro_gpu.stdin.flush()
+                _kokoro_gpu.terminate()
+            except Exception:
+                pass

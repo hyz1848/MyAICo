@@ -2,7 +2,7 @@
   "_tts_note": "默认 piper：本地 VITS + DirectML(AMD GPU)，实测 RTF 0.02~0.05、单句 120~220ms。sherpa=本地 Kokoro（CPU 上 RTF 1.5，慢）；edge=网络合成（~1.2s/句）。三者互为兜底，末端是 edge。",
   "_readme": "VoiceAI 统一配置。优先级：conf.json < 环境变量 < 命令行 --set=KEY=VALUE。改完需重启服务（worker 由服务拉起，会自动读同一份文件）。",
   "port": 8214,
-  "capture": "browser",
+  "capture": "server",
   "dataDir": "",
   "log": {
     "level": "info",
@@ -36,15 +36,30 @@
   },
   "tts": {
     "backend": "piper",
+    "_playback_note": "server=Python 端放音（可与采集同进程做 AEC）；browser=浏览器播放",
+    "playback": "server",
     "provider": "auto",
     "piperDir": "",
+    "_kokoro_note": "Kokoro 中英双语。实测：CPU/ONNX RTF 0.9~1.06；ROCm GPU RTF 1.5（更慢 ✗，MIOpen 对该模型只走通用 GEMM 兜底）→ 默认 CPU 路径；要试 GPU 置 kokoroUseGpu=true（需 venv-gpu）",
+    "kokoroDir": "",
+    "kokoroProvider": "cpu",
+    "kokoroVoice": 0,
+    "kokoroVoiceName": "zf_001",
+    "kokoroGpuPython": "",
     "voice": "zh-CN-XiaoxiaoNeural",
     "modelDir": "",
     "threads": 4,
     "timeoutSec": 15,
     "retries": 2,
     "failLimit": 3,
-    "lookahead": 2
+    "lookahead": 2,
+    "kokoroUseGpu": false
+  },
+  "aec": {
+    "_readme": "声学回声消除：只在 tts.playback=server 时生效（参考信号需与采集同进程）",
+    "enabled": true,
+    "taps": 2048,
+    "delaySamples": 5680
   },
   "asr": {
     "model": "paraformer-zh",

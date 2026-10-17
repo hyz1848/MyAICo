@@ -170,6 +170,22 @@ function startWorker() {
             prewarmPaths[result.text] = result.audio_path;
             log.info(`[TTS] 已预生成「${result.text}」(${result.backend || "?"})`);
           }
+          if (result.type === 'playback_start' || result.type === 'playback_end') {
+            // 服务端放音（Python 端）：worker 精确知道播报起止，用它维护"正在出声"窗口，
+            // 比浏览器心跳可靠（浏览器此时只显示文字，不播放任何音频）
+            if (result.type === 'playback_start') {
+              const durMs = Math.round((Number(result.duration) || 0) * 1000);
+              speakingUntil = Math.max(Date.now(), speakingUntil) + durMs + ECHO_TAIL_MS;
+              log.info(`[TTS] 服务端放音开始 #${result.id}（${(Number(result.duration) || 0).toFixed(2)}s）`);
+            } else {
+              log.info(`[TTS] 服务端放音结束 #${result.id}`);
+            }
+          }
+          if (result.type === 'aec_calibrated') {
+            if (result.applied) log.info('[AEC] 已应用标定延迟，后续按下发值工作');
+            log.info(`[AEC] 就地标定完成：delay=${result.delay} 样本（${(result.delay / 16).toFixed(0)}ms） `
+              + `ERLE=${result.erle}dB  候选=${JSON.stringify(result.top)}`);
+          }
           if (result.type === 'tts_audio') {
             log.info(`[TTS] #${result.id} 就绪(${result.backend || '?'}): ${(result.text || '').slice(0, 22)}`);
             // 用音频真实时长推算播报窗口：即使浏览器心跳丢了，服务端也知道还在出声。
@@ -376,6 +392,8 @@ let emptyAsrStreak = 0;    // 连续"有声音但识别为空"的次数（麦克
 const BARGE_IN = cfg.bargeIn.enabled;
 // 播报中打断所需的最短字数：环境里的短碎片（"是不是""接电话"）不该打断
 const BARGE_IN_MIN_CHARS = cfg.bargeIn.minChars;
+// 放音方式：server = Python 端放音（配合 AEC），browser = 浏览器播放
+const SERVER_PLAYBACK = String(cfg.tts.playback || 'server').toLowerCase() === 'server';
 
 let piClientPromise = null;
 function getLLM() {
@@ -627,7 +645,7 @@ function interrupt() {
   currentTtsId = null;
   playbackUntil = 0;           // 播放已停：租约与"正在出声"窗口都要清零，
   speakingUntil = 0;           // 否则后续真人说话会被当成"播报中的回声"全部吞掉
-  sendToWorker({ cmd: 'clear' });
+  sendToWorker({ cmd: 'clear' });      // 丢弃待合成 + 停掉服务端正在播的音频（worker 侧实现）
   broadcast({ type: 'stop_tts' });
 }
 
@@ -924,7 +942,7 @@ wss.on('connection', (ws) => {
   // 新连接（含刷新页面）恢复既有会话 + 告知采集模式
   if (ws.readyState === 1) {
     ws.send(JSON.stringify({ type: 'history', summary, messages: history, tokens: historyTokens() }));
-    ws.send(JSON.stringify({ type: 'hello', capture: CAPTURE_MODE, sampleRate: 16000, frameSamples: 1280, wakeWord: '潞潞同学', wakeRequired: WAKE_REQUIRED, awake: wakeGate.awake }));
+    ws.send(JSON.stringify({ type: 'hello', capture: CAPTURE_MODE, playback: SERVER_PLAYBACK ? 'server' : 'browser', sampleRate: 16000, frameSamples: 1280, wakeWord: cfg.wake.word, wakeRequired: WAKE_REQUIRED, awake: wakeGate.awake }));
   }
 
   ws.on('message', (data, isBinary) => {
@@ -946,6 +964,9 @@ wss.on('connection', (ws) => {
           sendToWorker({ cmd: 'stop_listen' });
           break;
         case 'playback': {
+          // 服务端放音模式：播放由 worker 自己驱动（并会回报 playback_start/end），
+          // 浏览器不再播放音频，也就不该再用它的心跳去覆盖门控状态
+          if (SERVER_PLAYBACK) break;
           // 播放中：租约 TTL；播放结束：仍保留一段尾巴窗（喇叭余音/混响还会被麦克风听到）
           playbackUntil = msg.on ? Date.now() + 1500 : Date.now() + ECHO_TAIL_MS;
           const want = !!msg.on;
@@ -976,6 +997,11 @@ wss.on('connection', (ws) => {
           break;
         case 'text':
           if (msg.text) handleUserText(msg.text, false);
+          break;
+        case 'aec_calibrate':
+          // 调试/现场标定：让 worker 在真实管线上测播放→麦克风延迟并应用
+          sendToWorker({ cmd: 'aec_calibrate' });
+          log.info('[AEC] 触发就地标定…');
           break;
         case 'asr_sim':
           // 调试/测试：直接注入一条"识别结果"，走与真实 ASR 完全相同的下行处理
