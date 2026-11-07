@@ -72,13 +72,19 @@ async function createPiClient(opts = {}) {
     api: 'openai-completions',
     provider: providerId,
     baseUrl,
-    reasoning: false,
+    // ★ 必须声明 true ✓：这台端点**总会回 `reasoning_content`** ✓（实测四种 chat_template_kwargs 都有 ✓
+    //   连 thinking:false 也回 ✓）。写成 false 时 SDK 把 reasoning 折进**可见正文** ✓ →
+    //   用户听到的是英文腹稿（"user wants 15*86. Use calculator." ✗）而不是答案 ✓
+    //   声明 true 之后 reasoning 单独走通道 ✓ 正文干净 ✓ 工具调用照常 ✓（thinking 仍可关 ✓ 不额外花时间 ✓）
+    reasoning: true,
     input: ['text'],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow,
     maxTokens: opts.maxTokens || 2048,
-    // 本地 OpenAI 兼容服务器（LM Studio/vLLM/Ollama 类）通常不认 developer 角色与 reasoning_effort
-    compat: { supportsDeveloperRole: false, supportsReasoningEffort: false },
+    // 本地 OpenAI 兼容服务器（LM Studio/vLLM/Ollama/Strata 类）通常不认 developer 角色与 reasoning_effort
+    // ★ maxTokensField 必须显式指 max_tokens ✓：pi-ai 默认发 OpenAI 新字段 max_completion_tokens ✗，
+    //   Strata 不认 → 请求等效无上限 → 它按"整窗剩余(259273)"预留 KV → 两张 7900 显存挤爆 → 引擎被杀 ✗
+    compat: { supportsDeveloperRole: false, supportsReasoningEffort: false, maxTokensField: 'max_tokens' },
   };
 
   const provider = pi.createProvider({
@@ -186,14 +192,19 @@ async function createPiClient(opts = {}) {
     let usage = null;
     const toolCalls = [];
 
-    arm(firstMs);
+    // ★ 首包超时只按"出字"解除 ✓：任何事件（start/思考）都重置成 30s 空闲 ✗
+    //   实测：Strata prefill 3.1k 提示词花了 31s（缓存冷）→ 被 30s 空闲看门狗杀掉 ✗
+    //   → 重试一次才答（用户干等 30s+，以为"没反应"）✗
+    //   现在：拿到第一个 text_delta 之前一直用 firstMs(90s) ✓ 之后才按 idleMs(30s) ✓
+    let armedMs = firstMs;
+    arm(armedMs);
     try {
       for await (const event of stream) {
-        arm(idleMs);
         switch (event.type) {
           case 'text_delta':
             text += event.delta;
             if (onDelta) onDelta(event.delta);
+            if (armedMs !== idleMs) { armedMs = idleMs; arm(idleMs); }
             break;
           case 'toolcall_end':
             if (event.toolCall) toolCalls.push(event.toolCall);
@@ -213,7 +224,7 @@ async function createPiClient(opts = {}) {
       // pi 声明请求失败不抛，但网络/驱动层异常仍需兜住
       stopReason = signal?.aborted ? 'aborted' : 'error';
       errorMessage = watchdogFired
-        ? `LLM 无响应（${Math.round((text ? idleMs : firstMs) / 1000)}s 内无数据），已中止本轮`
+        ? `LLM 无响应（${Math.round(armedMs / 1000)}s 内无数据），已中止本轮`
         : (e?.message || String(e));
     } finally {
       clearTimeout(watchdog);
@@ -255,7 +266,7 @@ async function createPiClient(opts = {}) {
     if (watchdogFired) {
       // 看门狗中止 ≠ 用户打断：必须报成错误，且用我们的说明覆盖驱动层的通用文案（"Request aborted"）
       stopReason = 'error';
-      errorMessage = `LLM 无响应（${Math.round((text ? idleMs : firstMs) / 1000)}s 内无数据），已中止本轮`;
+      errorMessage = `LLM 无响应（${Math.round(armedMs / 1000)}s 内无数据），已中止本轮`;
     }
     if (!stopReason) stopReason = 'stop';
     if (stopReason === 'aborted' && !errorMessage) errorMessage = 'aborted';

@@ -100,22 +100,87 @@ BLOCK_SIZE = 1280  # 80ms
 #   MME 48k/单声道 → RMS 0.198、峰值 0.925；而 16k → RMS 0.013 ✗（这就是"电平不动/识别恒为空"的根因）
 # 所以按 CAPTURE_RATE（默认 48k）采集，再盒式平均抽取到 16k 供 VAD/ASR/AEC 使用 ✓
 CAPTURE_RATE = conf_int("asr.captureRate", 48000)
+INPUT_BLOCK = 960                     # 采集回调块（20ms@48k）：MME 友好尺寸 ✓
+ASR_PAD_MS = conf_int("asr.padMs", 300)   # 识别前两端补的静音（让 paraformer 内部 VAD 有正常起止 ✓）
+ASR_DENOISE = conf_bool("asr.denoise", True)      # 识别前谱门限降噪 ✓（噪声≈语音时最有价值 ✓）
+RECORD_ON = conf_bool("debug.recordUserAudio", False)   # ★ 调试录音热开关：存下"模型真正听到的那份音频"✓（界面勾选框可实时改 ✓ set_record ✓ 不重启 ✓）
+ASR_KEEP_MAX = conf_int("asr.keepWavMax", 12)   # 只留最近 N 条 ✓（temp/asr_kept 不会无限涨 ✓）
+_last_asr_wav = None                            # 最近一次 transcribe 落盘的 wav 路径 ✓（ASR 单线程 ✓ 无并发问题 ✓）
+VAD_WEBRTC_MIN = conf_num("vad.webrtcMinRatio", 0.25)  # webrtcvad 二道闸：有话音的帧占比低于此值就跳过识别 ✓
+_vad = None
+
+
+def voiced_ratio(audio):
+    """webrtcvad 判定这段音频里"有人声"的帧占比 ✓
+    ✗ 自研能量门限在"房间噪声 ≈ 说话电平"时必然失灵（把噪声切成碎片 → 识别成片段/空 ✓ 用户实测）
+    ✓ webrtcvad 是真正的 VAD（判"是否人声"而非能量大小），用来拦掉这类碎片"""
+    global _vad
+    if _vad is None:
+        import webrtcvad
+        _vad = webrtcvad.Vad(2)          # 0~3：2 = 中等激进（实测较均衡 ✓）
+    pcm = np.clip(audio * 32768.0, -32768, 32767).astype(np.int16).tobytes()
+    frame = int(SAMPLE_RATE * 0.03) * 2          # 30ms @16bit ✓（webrtcvad 只认 10/20/30ms ✓）
+    if len(pcm) < frame:
+        return 0.0
+    voiced = total = 0
+    for i in range(0, len(pcm) - frame + 1, frame):
+        total += 1
+        if _vad.is_speech(pcm[i:i+frame], SAMPLE_RATE):
+            voiced += 1
+    return (voiced / total) if total else 0.0
 DECIM = max(1, int(round(CAPTURE_RATE / float(SAMPLE_RATE))))   # 48000/16000 = 3
 _capture_carry = np.zeros(0, dtype=np.float32)
+_out_carry = np.zeros(0, dtype=np.float32)
+
+
+# ★ 采集侧高通：实测本机噪声是 56~150Hz 的低频隆隆（风扇/气流/桌面振动 ✗），
+#   而人声在 300~3000Hz ✓ → 180Hz 高通可以在不碰人声的前提下把嗡声削掉 ✓
+#   （这是今晚"噪声≈语音"问题的对症解法之一 ✓；scipy 已修复可用 ✓）
+from scipy.signal import butter, lfilter, lfilter_zi
+
+_HP_HZ = conf_num("vad.highPassHz", 180)
+# ✗ 曾经把它设成 0 当"关闭"，却直接拿去建滤波器 → ValueError: critical frequencies must be > 0 → worker 启动即崩
+# ✓ 0（或超出有效范围）视为不启用；配置里必须保证这也是合法的"关闭"语义
+if 0 < _HP_HZ < SAMPLE_RATE / 2.0 - 1:
+    _b_hp, _a_hp = butter(2, _HP_HZ / (SAMPLE_RATE / 2.0), btype='high')
+    _zi_hp = lfilter_zi(_b_hp, _a_hp) * 0.0
+else:
+    _b_hp, _a_hp, _zi_hp = None, None, None
+
+
+def _highpass(block):
+    """流式二阶高通（保留滤波器状态 ✓ 无块间不连续）"""
+    global _zi_hp
+    if _b_hp is None or block.size == 0:
+        return block
+    y, _zi_hp = lfilter(_b_hp, _a_hp, block, zi=_zi_hp)
+    return y.astype(np.float32)
 
 
 def _decimate_capture(mono):
-    """原生率 → 16k：每 DECIM 个样本取均值（盒式低通，够 ASR 用 ✓），余数留到下一次避免时序漂移"""
-    global _capture_carry
-    if DECIM <= 1:
-        return mono
-    if _capture_carry.size:
-        mono = np.concatenate([_capture_carry, mono])
-    n = (mono.size // DECIM) * DECIM
-    _capture_carry = mono[n:].copy()
-    if n == 0:
-        return np.zeros(0, dtype=np.float32)
-    return mono[:n].reshape(-1, DECIM).mean(axis=1).astype(np.float32)
+    """原生率 → 16k，并攒满 BLOCK_SIZE(80ms) 才返回 ✓
+    ✗ 之前每来一块就发一块：小块采集时下游会收到 320 样本的碎块 → VAD 的静音计数（按块）全乱
+    ✓ 现在两级余数缓冲：原生率余数 + 16k 余数，保证下游块大小恒为 80ms"""
+    global _capture_carry, _out_carry
+    if DECIM > 1:
+        if _capture_carry.size:
+            mono = np.concatenate([_capture_carry, mono])
+        n = (mono.size // DECIM) * DECIM
+        _capture_carry = mono[n:].copy()
+        if n == 0:
+            return None
+        blk = mono[:n].reshape(-1, DECIM).mean(axis=1).astype(np.float32)
+    else:
+        blk = mono
+    if _out_carry.size:
+        blk = np.concatenate([_out_carry, blk])
+        _out_carry = np.zeros(0, dtype=np.float32)
+    if blk.size < BLOCK_SIZE:
+        _out_carry = blk.copy()
+        return None
+    n = (blk.size // BLOCK_SIZE) * BLOCK_SIZE
+    _out_carry = blk[n:].copy()
+    return blk[:n]
 
 VAD_ENERGY_MIN = conf_num("vad.energyMin", 0.02)    # absolute RMS floor for the gate
 VAD_FLOOR_MAX = conf_num("vad.floorMax", 0.025)    # 噪声底硬上限：超过这个值就可能把正常说话判成静音
@@ -126,11 +191,20 @@ SHORT_UTTERANCE_S = conf_num("vad.shortUtteranceS", 2.5) # 判定"短句"的时�
 PRE_ROLL = conf_int("vad.preRollBlocks", 5)            # blocks kept before onset (~400ms)
 MAX_UTTERANCE_S = conf_num("vad.maxUtteranceS", 30)     # segments longer than this are treated as ambient noise
 PLAYBACK_TAIL_S = cenv("VOICEAI_ECHO_TAIL_MS", "echo.tailMs", 900, float) / 1000.0  # 播报结束后的余音压制窗
+# ★ 识别前硬电平下限（RMS）：低于它直接跳过 ASR ✓（否则低电平碎片被放大后会幻觉出文本 ✗）
+#   本机实测分界：真实呼唤 0.053~0.087 ✓ / 噪声与键盘 0.009~0.024 ✗ → 取 0.025 卡在中间 ✓
+ASR_MIN_RMS = cenv("VOICEAI_ASR_MIN_RMS", "asr.minRms", 0.025, float)
 PLAYBACK_GATE_MULT = conf_num("vad.playbackGateMult", 1.8) # 播报中/余音期的起始门限倍数（配合内容过滤，门限不宜过狠否则听不到打断）
 PLAYBACK_SILENCE_MS = conf_int("vad.playbackSilenceMs", 900)   # 播报期的静音窗（比正常 1200ms 略短，兼顾"说停能较快生效"）
 PLAYBACK_MAX_UTTERANCE_S = conf_num("vad.playbackMaxUtteranceS", 12.0)  # 播报期最长片段：留足空间，避免把用户的话切碎（回声交给内容过滤）
+# ★ 播报期"确认打断"门限 ✓：VAD onset 只代表有声音，自己的回声也能触发 ✗
+#   实测：直接用 onset 暂停播音 → 18 次误触发 → 回答被反复暂停/续播，听起来卡顿 ✗
+#   这里要求"持续 ≥400ms 且平均电平 ≥0.045"才算人声开口 ✓ 回声通常 <0.03 且不持续 ✓
+BARGE_ONSET_MS = conf_int("vad.bargeOnsetMs", 400)
+BARGE_ONSET_RMS = conf_num("vad.bargeOnsetRms", 0.045)
 
 TMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp")
+MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")   # Piper 多音色按目录名定位 ✓
 os.makedirs(TMP_DIR, exist_ok=True)
 
 _print_lock = threading.Lock()
@@ -176,6 +250,20 @@ if AEC_ENABLED:
 
 _player = None
 _aec_report = type('R', (), {})()
+
+
+def resolve_device(val):
+    """设备值解析：纯数字按**索引** ✓，其它按名称子串 ✓（✗ 否则 "9" 会撞上 MU900 里的 9）"""
+    if val is None:
+        return None
+    if isinstance(val, int):
+        return val
+    t = str(val).strip()
+    if not t:
+        return None
+    if t.lstrip('+-').isdigit():
+        return int(t)
+    return t
 
 
 def resample(data, sr, target):
@@ -363,9 +451,10 @@ def audio_callback(indata, frames, time_info, status):
     # 采集侧回声消除：先用 AEC 减去估计回声，再做 VAD/识别。
     # 参考信号由 Player 的播放回调提供（同进程、同时间轴），这是能真正消回声的前提。
     block = np.asarray(indata[:, 0], dtype=np.float32) if indata.ndim > 1 else np.asarray(indata, dtype=np.float32)
-    block = _decimate_capture(block)          # 原生率 → 16k（见 CAPTURE_RATE 注释）
-    if block.size == 0:
+    block = _decimate_capture(block)          # 原生率 → 16k，且攒满 80ms 才下发（见函数注释）
+    if block is None:
         return
+    block = _highpass(block)                  # 180Hz 高通：削掉 56~150Hz 的风扇/隆隆声 ✓ 不碰人声 ✓
     if _aec is not None:
         block = _aec.process(block)
     if _listen_active and not _feed_mode:
@@ -398,6 +487,9 @@ def listen_loop():
     preroll = deque(maxlen=PRE_ROLL)
     last_voice = 0.0
     noise_floor = 0.002
+    voiced_sum = 0.0        # 本段人声块的电平累计（用于"确认打断"判定）
+    voiced_n = 0
+    barge_sent = False      # 本段是否已上报过 barge_onset（一段只报一次）
 
     out({"type": "vad_state", "state": "listening"})
 
@@ -427,12 +519,24 @@ def listen_loop():
                 collected = list(preroll) + [block]
                 preroll.clear()
                 last_voice = now
+                voiced_sum = rms
+                voiced_n = 1
+                barge_sent = False
                 out({"type": "vad_state", "state": "speech"})
 
         elif state == "speech":
             collected.append(block)
             if rms > threshold * 0.7:
                 last_voice = now
+                voiced_sum += rms
+                voiced_n += 1
+                # ★ 播报期确认打断 ✓：持续够久 + 平均电平够高 → 才让服务端暂停播音 ✓
+                #   （vad_state=speech 在播报期会被自己的回声触发 ✗ 见 BARGE_ONSET_RMS 注释）
+                if echo_suppress and not barge_sent and (now - speech_start) * 1000.0 >= BARGE_ONSET_MS:
+                    avg = voiced_sum / max(1, voiced_n)
+                    if avg >= BARGE_ONSET_RMS:
+                        barge_sent = True
+                        out({"type": "barge_onset"})
             else:
                 # 静音窗自适应：短句（唤醒词/短指令）用更短的窗，明显降低"说完还要等"的感觉；
                 # 长句仍用长窗，避免说话中间换气被切断。
@@ -479,65 +583,124 @@ def load_asr_model():
     _model_ready.set()
 
 
-def transcribe(audio_data):
+def transcribe(audio_data, keep=False):
     if audio_data is None or len(audio_data) == 0:
         return ""
     if not _model_ready.wait(timeout=300):
         raise RuntimeError("ASR model failed to load")
+    # ★ 两端补静音：paraformer 内部自带 VAD（vad_model=fsmn-vad），
+    #   ✗ 直接喂一段被切得很紧的片段时，它的内部 VAD 可能判不出完整语句 → 返回空/丢字
+    #     （用户实测症状："必须说很快，一停顿就只识别一部分"、"请详细介绍一下你" → "轻容的介绍一下你"）
+    #   ✓ 前后各补 PAD_MS 静音，让内部 VAD 有正常的起止点
+    audio_data = np.asarray(audio_data, dtype=np.float32)
+    if ASR_DENOISE:
+        try:
+            import noisereduce as nr
+            audio_data = nr.reduce_noise(y=audio_data, sr=SAMPLE_RATE,
+                                         stationary=True, prop_decrease=0.8).astype(np.float32)
+        except Exception as de:
+            print(f"[asr] 降噪失败（忽略，继续识别）: {de}", file=sys.stderr, flush=True)
+    pad = np.zeros(int(SAMPLE_RATE * ASR_PAD_MS / 1000.0), dtype=np.float32)
+    audio_data = np.concatenate([pad, audio_data, pad])
     temp_path = os.path.join(TMP_DIR, f"asr_{uuid.uuid4().hex}.wav")
     sf.write(temp_path, audio_data, SAMPLE_RATE)
     try:
         results = _asr_model.generate(input=temp_path)
         text = ""
         if results and len(results) > 0:
-            text = results[0].get("text", "").strip().replace(" ", "")
+            raw = (results[0].get("text", "") or "").strip()
+            # ★ 兼容两种输出 ✓：
+            #   paraformer  → `别 说 了`（无标签 ✓）
+            #   SenseVoice  → `<|zh|><|NEUTRAL|><|Speech|><|woitn|>别说了`（带标签 ✓）
+            #   → 统一**剥掉所有 `<|…|>`** ✓ 并记下语言标签 ✓
+            # ★ 语言判据的依据（实测 ✓）：同一批 rms=0.02 的合成噪声（白噪/咔哒/低频嗡/静音 ✓ 绝非人声 ✓）
+            #   被 SenseVoice 标成 `<|Speech|>` ✗ 且语言判成 `ko`/`en` ✗；而用户 6/6 条真语音全是 `<|zh|>` ✓✓
+            #   → 纯中文场景下「标签不是 zh 就丢」是 6/6 vs 4/4 有效的零成本判据 ✓（标签本身**不是**噪声判据 ✗ 已实测否掉 ✓）
+            _parts, _lang, _i = [], None, 0
+            while True:
+                _a = raw.find("<|", _i)
+                if _a < 0:
+                    _parts.append(raw[_i:])
+                    break
+                _parts.append(raw[_i:_a])
+                _b = raw.find("|>", _a + 2)
+                if _b < 0:
+                    break
+                _tag = raw[_a + 2:_b]
+                if _lang is None and _tag in ("zh", "en", "ja", "ko", "yue"):
+                    _lang = _tag
+                _i = _b + 2
+            text = "".join(_parts).strip().replace(" ", "")
+            if _lang and _lang != "zh":
+                print(f"[asr] 语言判据丢弃（lang={_lang} ✗ 非中文 ✓ 疑似噪声）：{raw!r}",
+                      file=sys.stderr, flush=True)
+                text = ""
         return text
     finally:
-        try:
-            os.remove(temp_path)
-        except OSError:
-            pass
+        global _last_asr_wav
+        _last_asr_wav = temp_path
+        if not keep:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        # keep=True：文件留给调用方改名 ✓ 存的就是模型实际读到的字节 ✓（不是事后重采样 ✓）
 
 
-# ========== TTS: 本地(sherpa-onnx/Kokoro) 优先，edge-tts 兜底 ==========
+# ========== TTS: 本地 Piper + 在线 edge-tts ==========
 SYNTH_TIMEOUT = cenv("VOICEAI_TTS_TIMEOUT", "tts.timeoutSec", 15, float)
 SYNTH_RETRIES = cenv("VOICEAI_TTS_RETRIES", "tts.retries", 2, int)
 def _tts_order(backend):
     """首选后端 + 其余兜底（末端 edge 网络合成）"""
-    return [backend] + [b for b in ("piper", "melo", "edge", "sherpa", "kokoro") if b != backend]
+    return [backend] + [b for b in ("piper", "edge") if b != backend]
 
 
-TTS_BACKEND = cenv("VOICEAI_TTS", "tts.backend", "piper", str).lower()   # piper | kokoro | sherpa | edge
-# 兜底顺序按实测速度/可用性排：首选之后依次 piper → edge → sherpa。
-# sherpa(Kokoro) 在 CPU 上 RTF 1.5（比实时慢、跟不上播放），只作最后手段；
-# edge 是网络合成但要 1.2s/句、质量稳，排在 piper 之后。
+TTS_BACKEND = cenv("VOICEAI_TTS", "tts.backend", "piper", str).lower()   # piper | edge
+# 实测结论（用户）：中文 edge 最好 ✓；Piper 作离线兜底 ✓。
+# 已淘汰 ✗：Kokoro / sherpa / MeloTTS / CosyVoice / VibeVoice / Qwen3-TTS / IndexTTS
+# （对应模型文件与代码已一并清理 ✓，回收约 32GB）
 TTS_ORDER = _tts_order(TTS_BACKEND)
-_local_tts = None
-_local_fails = 0            # 本地连续失败次数
-_local_disabled = False     # 连续失败达上限后本次进程内不再尝试本地
-_missing_logged = False     # "模型未就绪"只提示一次，避免每句刷屏
-_piper_tts = None
-_kokoro_tts = None
-_melo_tts = None          # 本地 MeloTTS（sherpa-onnx，中英双语，中文韵律比 Kokoro-zh/Piper 自然 ✓）
-_kokoro_sc = None         # 常驻 sidecar 进程（默认主 venv 的 cpu 版 torch）
-_kokoro_sc_lock = None
+_piper_tts = None          # 每个模型目录一个 PiperTts 实例 ✓
 _piper_fails = 0
 _piper_disabled = False
 _piper_missing_logged = False
 LOCAL_FAIL_LIMIT = cenv("VOICEAI_TTS_FAIL_LIMIT", "tts.failLimit", 3, int)
 
 
-def _get_piper():
-    """Piper(VITS) 本地 TTS：可跑 DirectML(AMD GPU)，实测 RTF 0.02~0.05"""
+def _parse_piper_voice(voice):
+    """解析音色串 "piper:<模型目录名>[:<说话人id>]" → (模型目录绝对路径, 说话人id 或 None) ✓
+
+    非 piper 前缀返回 (None, None)，表示用默认模型 ✓。
+    """
+    if not voice or not str(voice).startswith("piper:"):
+        return None, None
+    parts = str(voice).split(":")
+    dirname = parts[1] if len(parts) > 1 else ""
+    sid = parts[2] if len(parts) > 2 and parts[2] != "" else None
+    if not dirname:
+        return None, sid
+    return os.path.join(MODELS_DIR, dirname), sid
+
+
+def _get_piper(model_dir=None):
+    """Piper(VITS) 本地 TTS：可跑 DirectML(AMD GPU)，实测 RTF 0.02~0.05。
+
+    按模型目录分别缓存 ✓（多音色 = 多个模型目录 ✓）
+    """
     global _piper_tts
+    key = model_dir or ""
     if _piper_tts is None:
+        _piper_tts = {}
+    tt = _piper_tts.get(key)
+    if tt is None:
         from tts_piper import PiperTts
-        _piper_tts = PiperTts(model_dir=conf("tts.piperDir") or None,
-                              provider=conf("tts.provider", "auto"),
-                              num_threads=cenv("VOICEAI_TTS_THREADS", "tts.threads", 4, int))
-        print(f"[tts] Piper 模型目录: {_piper_tts.model_dir} 可用={_piper_tts.available()}",
+        tt = PiperTts(model_dir=model_dir or conf("tts.piperDir") or None,
+                      provider=conf("tts.provider", "auto"),
+                      num_threads=cenv("VOICEAI_TTS_THREADS", "tts.threads", 4, int))
+        _piper_tts[key] = tt
+        print(f"[tts] Piper 模型目录: {tt.model_dir} 可用={tt.available()}",
               file=sys.stderr, flush=True)
-    return _piper_tts
+    return tt
 
 
 def synth_piper(text, voice=None):
@@ -545,13 +708,14 @@ def synth_piper(text, voice=None):
     global _piper_fails, _piper_disabled, _piper_missing_logged
     if _piper_disabled:
         raise RuntimeError("Piper 已因连续失败禁用（重启 worker 可恢复）")
-    tt = _get_piper()
+    model_dir, sid = _parse_piper_voice(voice)
+    tt = _get_piper(model_dir)
     if not tt.available():
         raise PiperUnavailable(f"Piper 模型缺失: {tt.model_dir}")
     t0 = time.time()
     out = os.path.join(TMP_DIR, f"tts_{uuid.uuid4().hex}.wav")
     try:
-        path, dur = tt.synthesize(text, out)
+        path, dur = tt.synthesize(text, out, speaker=sid, speed=TTS_SPEED)
     except Exception:
         if os.path.exists(out):
             try:
@@ -561,184 +725,13 @@ def synth_piper(text, voice=None):
         raise
     _piper_fails = 0
     print(f"[tts] Piper 合成 {len(text)}字 ({(time.time() - t0) * 1000:.0f}ms, "
-          f"{tt.provider_used}, 音频 {dur:.2f}s)", file=sys.stderr, flush=True)
+          f"{tt.provider_used}, 音频 {dur:.2f}s, 音色={voice or '默认'})",
+          file=sys.stderr, flush=True)
     return path
 
 
-def _get_kokoro():
-    """Kokoro（中英双语）。实测：CPU RTF 0.8~0.9；**DirectML 会崩**（动态 shape 图），故默认 cpu"""
-    global _kokoro_tts
-    if _kokoro_tts is None:
-        from tts_kokoro import KokoroTts
-        _kokoro_tts = KokoroTts(model_dir=conf("tts.kokoroDir") or None,
-                                provider=conf("tts.kokoroProvider", "cpu"),
-                                voice=conf_int("tts.kokoroVoice", 0),
-                                threads=cenv("VOICEAI_TTS_THREADS", "tts.threads", 4, int))
-        print(f"[tts] Kokoro 模型目录: {_kokoro_tts.model_dir} 可用={_kokoro_tts.available()}",
-              file=sys.stderr, flush=True)
-    return _kokoro_tts
+TTS_SPEED = conf_num("tts.speed", 1.0)   # 通用语速：Piper 每句传参 ✓（与 UI 的"语速"同源 ✓）
 
-
-def synth_kokoro(text, voice=None):
-    from tts_kokoro import KokoroUnavailable
-    t = _get_kokoro()
-    if not t.available():
-        raise KokoroUnavailable(f"Kokoro 模型缺失: {t.model_dir}")
-    t0 = time.time()
-    out = os.path.join(TMP_DIR, f"tts_{uuid.uuid4().hex}.wav")
-    path, dur = t.synthesize(text, out)
-    print(f"[tts] Kokoro 合成 {len(text)}字 ({(time.time() - t0) * 1000:.0f}ms, "
-          f"{t.provider_used}, 音频 {dur:.2f}s)", file=sys.stderr, flush=True)
-    return path
-
-
-def kokoro_sidecar_python():
-    """Kokoro sidecar 用的解释器：优先配置；默认主 venv（cpu 版 torch 实测 RTF 0.25~0.60 ✓），
-    其次 venv-gpu（ROCm torch，GPU 实验用 —— 本机 Windows 上反而更慢 ✗）"""
-    here = os.path.dirname(os.path.abspath(__file__))
-    for p in (conf("tts.kokoroSidecarPython"),
-              os.path.join(here, "venv", "Scripts", "python.exe"),
-              os.path.join(here, "venv-gpu", "Scripts", "python.exe")):
-        if p and os.path.exists(p):
-            return p
-    return None
-
-
-def _kokoro_sidecar_env():
-    """sidecar 的环境：PYTHONPATH 注入隔离依赖目录（kokoro-deps），
-    免得 Kokoro 的 transformers/tokenizers/scipy 与主 venv 的 funasr 打架 ✗"""
-    env = dict(os.environ)
-    env.setdefault("PYTHONIOENCODING", "utf-8")
-    # torch 启动时读 OMP/MKL 线程数 → 用环境变量传，最省事 ✓（此前 tts.threads 是死配置 ✗）
-    _th = str(cenv("VOICEAI_TTS_THREADS", "tts.threads", 4, int))
-    env["OMP_NUM_THREADS"] = _th
-    env["MKL_NUM_THREADS"] = _th
-    env["VOICEAI_TTS_THREADS"] = _th
-    dep = conf("tts.kokoroSidecarPath") or os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "kokoro-deps")
-    if os.path.isdir(dep):
-        env["PYTHONPATH"] = (dep + os.pathsep + env["PYTHONPATH"]) if env.get("PYTHONPATH") else dep
-    return env
-
-
-def _kokoro_sidecar_proc():
-    """懒启动常驻 sidecar（模型只加载一次；每句重载模型会白等 1~2 秒）。
-    设备由 tts_kokoro_gpu.py 按 torch.cuda.is_available() 自选：
-    主 venv → cpu（快且确定 ✓）；venv-gpu → gpu（本机 Windows 上默认更慢 ✗）"""
-    global _kokoro_sc, _kokoro_sc_lock
-    import subprocess
-    if _kokoro_sc_lock is None:
-        _kokoro_sc_lock = threading.Lock()
-    with _kokoro_sc_lock:
-        if _kokoro_sc is not None and _kokoro_sc.poll() is None:
-            return _kokoro_sc
-        py = kokoro_sidecar_python()
-        if not py:
-            return None
-        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tts_kokoro_gpu.py")
-        env = _kokoro_sidecar_env()
-        # ROCm 运行时若在外部 SDK 里，补进 PATH（torch 轮子通常自带，缺了才需要）
-        rocm_bin = os.path.join(os.environ.get("HIP_PATH", r"D:\Program Files\AMD\ROCm"), "bin")
-        if os.path.isdir(rocm_bin) and rocm_bin not in env.get("PATH", ""):
-            env["PATH"] = rocm_bin + os.pathsep + env.get("PATH", "")
-        _kokoro_sc = subprocess.Popen([py, script, "--server"], stdin=subprocess.PIPE,
-                                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                      text=True, encoding="utf-8", bufsize=1, env=env)
-        line = _kokoro_sc.stdout.readline()      # 等 ready
-        if not line:
-            raise RuntimeError("Kokoro sidecar 启动失败")
-        print(f"[tts] Kokoro sidecar 就绪: {line.strip()}", file=sys.stderr, flush=True)
-        return _kokoro_sc
-
-
-KOKORO_SPEED = conf_num("tts.kokoroSpeed", 1.0)   # 可被 set_speed 热改：语速偏慢会显得呆板 ✓
-
-
-def synth_kokoro_sidecar(text, voice=None):
-    """Kokoro 合成（常驻 sidecar：默认主 venv 的 cpu 版 torch，实测 RTF 0.25~0.60 ✓）"""
-    import json
-    proc = _kokoro_sidecar_proc()
-    if proc is None:
-        raise RuntimeError("未找到 sidecar 解释器（venv/Scripts/python.exe）")
-    out = os.path.join(TMP_DIR, f"tts_{uuid.uuid4().hex}.wav")
-    vname = voice if (voice and not voice.startswith("zh-CN")) else conf("tts.kokoroVoiceName", "zf_001")
-    req = json.dumps({"text": text, "out": out, "voice": vname, "speed": KOKORO_SPEED},
-                     ensure_ascii=False)
-    with _kokoro_sc_lock:
-        proc.stdin.write(req + "\n")
-        proc.stdin.flush()
-        r = None
-        while r is None:
-            line = proc.stdout.readline()
-            if not line:
-                raise RuntimeError("Kokoro sidecar 无响应")
-            try:
-                cand = json.loads(line)
-            except Exception:
-                continue                          # 启动期的 WARNING 等非 JSON 行
-            if isinstance(cand, dict) and "ok" in cand:
-                r = cand
-    if not r.get("ok"):
-        raise RuntimeError(r.get("error", "未知错误"))
-    print(f"[tts] Kokoro 合成 {len(text)}字 ({r.get('ms')}ms, 音频 {r.get('dur')}s, 语速 {KOKORO_SPEED}, "
-          f"设备 {r.get('device') or 'cpu'}{', 显存 %sMB' % r['vram'] if r.get('vram') else ''}, "
-          f"音色 {vname})", file=sys.stderr, flush=True)
-    return r["path"]
-
-
-def _get_melo_tts():
-    global _melo_tts
-    if _melo_tts is None:
-        from tts_sherpa import SherpaTts
-        _melo_tts = SherpaTts(model_dir=conf("tts.meloDir") or None,
-                              threads=cenv("VOICEAI_TTS_THREADS", "tts.threads", 4, int))
-        print(f"[tts] MeloTTS 模型目录: {_melo_tts.model_dir} 可用={_melo_tts.available()}",
-              file=sys.stderr, flush=True)
-    return _melo_tts
-
-
-def synth_melo(text, voice=None):
-    """本地 MeloTTS 合成（sherpa-onnx）。voice 传数字字符串时当 speaker id ✓"""
-    t0 = time.time()
-    tts = _get_melo_tts()
-    if not tts.available():
-        raise RuntimeError(f"MeloTTS 模型未就绪: {tts.model_dir}")
-    sid = conf_int("tts.meloSid", 0)
-    if voice and str(voice).isdigit():
-        sid = int(voice)
-    speed = conf_num("tts.meloSpeed", 1.0)
-    out = os.path.join(TMP_DIR, f"tts_{uuid.uuid4().hex}.wav")
-    path, dur = tts.synthesize(text, out, sid=sid, speed=speed)
-    print(f"[tts] Melo 合成 {len(text)}字 ({(time.time() - t0) * 1000:.0f}ms, "
-          f"音频 {dur:.2f}s, speaker {sid})", file=sys.stderr, flush=True)
-    return path
-
-
-def _get_local_tts():
-    global _local_tts
-    if _local_tts is None:
-        from tts_local import SherpaTts
-        _local_tts = SherpaTts(num_threads=cenv("VOICEAI_TTS_THREADS", "tts.threads", 4, int),
-                               model_dir=conf("tts.modelDir") or None)
-        print(f"[tts] 本地 TTS 模型目录: {_local_tts.model_dir} 可用={_local_tts.available()}",
-              file=sys.stderr, flush=True)
-    return _local_tts
-
-
-class LocalTtsUnavailable(RuntimeError):
-    """本地模型缺失/不完整——配置状态，不是故障，不能计入粘性失败计数"""
-
-
-def synth_local(text, voice=None):
-    """本地合成，写 24k/16k WAV，返回路径"""
-    tts = _get_local_tts()
-    if not tts.available():
-        raise LocalTtsUnavailable(f"本地 TTS 模型缺失: {tts.model_dir}")
-    out = os.path.join(TMP_DIR, f"tts_{uuid.uuid4().hex}.wav")
-    path, _dur = tts.synthesize(text, out, voice=voice)
-    if not os.path.exists(path) or os.path.getsize(path) == 0:
-        raise RuntimeError("本地 TTS 输出为空")
-    return path
 
 
 async def _synth_once(text, voice, output_path):
@@ -750,6 +743,10 @@ async def _synth_once(text, voice, output_path):
 
 
 def synth_edge(text, voice="zh-CN-XiaoxiaoNeural"):
+    # 兜底保护 ✓：voice 可能来自 Piper 规格（piper:xxx ✗）或空值 ✗ → 用默认音色，
+    # 否则"Piper 失败 → 退 edge"这一层会再失败一次，整句就彻底没声音了 ✗
+    if not voice or ':' in str(voice) or not str(voice).lower().endswith('neural'):
+        voice = "zh-CN-XiaoxiaoNeural"
     import asyncio
     output_path = os.path.join(TMP_DIR, f"tts_{uuid.uuid4().hex}.mp3")
     last_err = None
@@ -764,6 +761,12 @@ def synth_edge(text, voice="zh-CN-XiaoxiaoNeural"):
         except Exception as e:
             last_err = e
             print(f"[tts] attempt {attempt + 1} failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+            # ★ 音色不被端点接受 ✗（下架 / 拼错 ✓）→ 重试也是白等 ✗（实测每句白烧 1~2 秒才兜底 Piper ✓）
+            #   按类名判 ✓：edge-tts 各版本异常路径不同 ✓（edge_tts.exceptions.NoAudioReceived ✓）
+            if type(e).__name__ == "NoAudioReceived":
+                print("[tts] NoAudioReceived：多半是音色已下架或名字不对 ✓ 直接放弃 edge、不再重试 ✓",
+                      file=sys.stderr, flush=True)
+                break
     detail = f"{type(last_err).__name__}: {last_err}" if last_err else "unknown"
     raise RuntimeError(f"TTS failed after {SYNTH_RETRIES} attempts ({detail})")
 
@@ -771,13 +774,11 @@ def synth_edge(text, voice="zh-CN-XiaoxiaoNeural"):
 def synthesize(text, voice="zh-CN-XiaoxiaoNeural"):
     """统一入口：按优先级链合成。返回 (路径, 后端名)。
 
-    TTS_ORDER = 首选 + 其余兜底（末端 edge 网络）：
-      piper  —— 本地 VITS，实测 DirectML(RX 9070 XT) RTF 0.02~0.05，单句 120~220ms
-      sherpa —— 本地 Kokoro（CPU 上 RTF 1.5，慢，仅作次级兜底）
-      edge   —— edge-tts 网络合成（~1.2s/句，质量稳）
+    TTS_ORDER = 首选 + 兜底（只保留实测可用的两条路 ✓）：
+      piper —— 本地 VITS(Piper) ✓ 离线可用，DirectML/CPU 单句 120~220ms
+      edge  —— edge-tts 在线合成 ✓（~1.2s/句，中文质量最稳 ✓）
     某个后端连续失败 tts.failLimit 次后本进程内跳过它，避免每句白等一次异常。
     """
-    global _local_fails, _local_disabled, _missing_logged
     global _piper_fails, _piper_disabled, _piper_missing_logged
     last_err = None
 
@@ -787,36 +788,6 @@ def synthesize(text, voice="zh-CN-XiaoxiaoNeural"):
                 p = synth_piper(text, voice)
                 if p:
                     return p, "piper"
-            elif backend == "melo":
-                # 本地 MeloTTS（sherpa-onnx，中英）：中文韵律明显比 Piper/Kokoro-zh 自然 ✓
-                p = synth_melo(text, voice)
-                if p:
-                    return p, "melo"
-            elif backend == "kokoro":
-                # 常驻 sidecar（主 venv 的 cpu 版 torch + kokoro-deps）实测 RTF 0.25~0.60 ✓，
-                # 比 ONNX 路径（0.9~1.06）快约 4 倍 ✓；ONNX 仅作兜底
-                if kokoro_sidecar_python():
-                    p = synth_kokoro_sidecar(text, voice)
-                    if p:
-                        return p, "kokoro"
-                p = synth_kokoro(text, voice)
-                if p:
-                    return p, "kokoro-onnx"
-            elif backend == "sherpa":
-                if _local_disabled:
-                    continue
-                tt = _get_local_tts()
-                if not tt.available():
-                    if not _missing_logged:
-                        _missing_logged = True
-                        print(f"[tts] 本地 Kokoro 模型未就绪: {tt.model_dir}", file=sys.stderr, flush=True)
-                    continue
-                t0 = time.time()
-                path = synth_local(text, voice=voice)
-                _local_fails = 0
-                print(f"[tts] Kokoro 合成 {len(text)}字 {(time.time() - t0) * 1000:.0f}ms",
-                      file=sys.stderr, flush=True)
-                return path, "sherpa"
             elif backend == "edge":
                 t0 = time.time()
                 path = synth_edge(text, voice)
@@ -833,17 +804,33 @@ def synthesize(text, voice="zh-CN-XiaoxiaoNeural"):
                     _piper_disabled = True
                     print(f"[tts] Piper 连续失败 {LOCAL_FAIL_LIMIT} 次，本次进程内不再尝试",
                           file=sys.stderr, flush=True)
-            elif backend == "sherpa":
-                _local_fails += 1
-                print(f"[tts] Kokoro 失败({_local_fails}/{LOCAL_FAIL_LIMIT}): {type(e).__name__}: {e}",
-                      file=sys.stderr, flush=True)
-                if _local_fails >= LOCAL_FAIL_LIMIT:
-                    _local_disabled = True
             else:
                 print(f"[tts] edge 失败: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
 
     raise RuntimeError(f"所有 TTS 后端都失败（最后错误: {last_err}）")
 
+
+def utterance_conf(rms, gain, dur, text):
+    """「可信度」0~100 ✓ 与它的分项原始值 ✓。
+    ★ 这**不是**模型后验 ✗：实测 funasr 的 paraformer 只返回 key/text/timestamp ✓
+      （`return_time`/`output_timestamp`/`label`/`decoding_ctc_weight` 四种入参全试过 ✗ 没有 confidence/cer/loss ✓）
+      真·后验得摸 model 内部（model.py:345 的 log_softmax ✓）+ 再跑一遍前向 ✗ 143~602ms 等于翻倍 ✗ 不当默认代价付 ✓
+    → 用**当天 60 条实录**里真正区分「认对」与「幻觉」的量来定 ✓：
+      原始电平 rms ✓（成功 0.09~0.14 ✓ 幻觉 0.009~0.030 ✓；下限 asr.minRms ✓ 目标 asr.targetRms ✓）
+      数字增益 gain ✓（1.0 最好 ✓ 顶到 asr.maxGain 说明原始电平太低 ✗）
+      时长 dur ✓（太短不可信 ✗）
+      文本自洽 ✓（空 ✗；两三秒静音只吐一两个字 = paraformer 幻觉 ✓）
+    分项一起给前端 ✓（悬停核对 ✓ 不是黑箱 ✓）"""
+    target = conf_num("asr.targetRms", 0.1) or 0.1
+    maxg = conf_num("asr.maxGain", 8.0) or 8.0
+    floor = conf_num("asr.minRms", 0.04) or 0.04
+    level = max(0.0, min(1.0, (rms - floor) / max(1e-6, target - floor)))      # 电平 ✓ 权重最高 ✓（实测它是唯一判别量 ✓）
+    gscor = max(0.0, min(1.0, 1.0 - (gain - 1.0) / max(1e-6, maxg - 1.0)))     # 增益越接近 1 越好 ✓
+    dscor = 1.0 if 0.4 <= dur <= 12.0 else (0.5 if dur < 0.4 else 0.6)         # 时长 ✓
+    nch = len("".join((text or "").split()))   # 去掉所有空白后的字数 ✓（不引 re ✓ 一个 split 就够 ✓）
+    tscor = 0.0 if nch == 0 else (0.35 if (nch == 1 and dur >= 2.0) else (0.7 if nch == 1 else 1.0))   # 长静音只吐一字 = 幻觉 ✓
+    w = 0.45 * level + 0.25 * gscor + 0.15 * dscor + 0.15 * tscor
+    return int(round(w * 100)), {"rms": round(rms, 4), "gain": round(gain, 2), "dur": round(dur, 2), "chars": nch}
 
 def normalize_for_asr(audio, target_rms=None, max_gain=None):
     """识别前自动增益：麦克风电平偏低（实测用户侧峰值仅 0.03~0.04）时，
@@ -870,9 +857,126 @@ def asr_worker():
             t_asr0 = time.time()
             duration = len(audio) / SAMPLE_RATE
             seg_rms = float(np.sqrt(np.mean(audio * audio)))
+            # ★ 电平门槛要量「人声窗」的最大能量 ✓，不是整段平均 rms ✗
+            #   短词落在长段里会被前后静音稀释 ✓（实测 ✓：用户说「露露同学」只占 ≈0.8s ✓ 段长 2.24s ✓
+            #   → 整段 rms 0.012 ✗ 被丢 ✓，可人声窗 0.02~0.032、峰值 0.08 ✓ 明明是人声 ✓ → 越短越容易被丢 ✓）
+            #   68 条留证音频实测分界 ✓：认对的段 burst 最小 **0.232** ✓ / 低电平噪声段 burst 最大 **0.031** ✗
+            #   → 沿用同一条 ASR_MIN_RMS(0.04) ✓ 换度量后现有语料**一条都不改判** ✓（不降级 ✓）
+            _win = 1600  # 100ms @16k ✓
+            if len(audio) >= _win:
+                _fr = np.asarray(audio)[:(len(audio) // _win) * _win].reshape(-1, _win)
+                burst = float(np.sqrt(np.mean(_fr * _fr, axis=1)).max())
+            else:
+                burst = seg_rms  # 段太短 ✓ 平均即窗 ✓
+            # ★ 识别前硬电平下限 ✓（在自动增益之前拦 ✓）
+            #   为什么必须有它：低电平碎片经 normalize_for_asr 放大到 0.1 后 ✗，paraformer 会产生
+            #   **幻觉文本** ✗（实测 0.009 电平被识别成"嘟嘟"/"啦啦啦" ✗）→ 这些幻觉还会误触发唤醒/停词 ✗。
+            #   本机实测的干净分界：真实呼唤 rms 0.053~0.087 ✓ / 噪声与键盘 0.009~0.024 ✗ → 取 0.025 ✓
+            # ★ 判据从 `burst`（最大窗）换成 **`top3`（前三大窗均值）** ✓✓
+            #   实测证据 ✗：播报期一个"咔哒"瞬态就能把 burst 顶到 0.10 ✓ 让 ASR 从原始 0.0014 的噪声里
+            #   **编出整句**（「你们回来的时候」✗「我们已经听到了什么」✗ —— 与正在播的 TTS 文本**一个词都不重合** ✓
+            #   所以不是喇叭回声 ✓ 是噪声幻觉 ✓）
+            #   top3 的分界（同一批留证音频 ✓）：真人声 0.19~0.44 ✓ / 噪声与瞬态 0.0085~0.017 ✗ = **11 倍**
+            _eff_min = ASR_MIN_RMS * 2.5 if _playback_active else ASR_MIN_RMS
+            if len(audio) >= _win:
+                _fr2 = np.asarray(audio)[:(len(audio) // _win) * _win].reshape(-1, _win)
+                _env = np.sqrt(np.mean(_fr2 * _fr2, axis=1))
+                top3 = float(np.mean(np.sort(_env)[-3:])) if _env.size else seg_rms
+                # ★ 第三道判据：**持续时长** ✓✓（用户实测 ✗："非常明显的噪音 根本不是人声 为什么也会生成内容" ✓）
+                #   敲桌/咔哒/电流声的能量集中在 1~2 个窗（<150ms ✓）而人说话是 ≥300ms 的连续音节串 ✓
+                #   → 数"最长的一段连续高能窗" ✓ 太短就不喂 ASR ✓（噪声没法伪装"持续"✓）
+                _hi = max(top3 * 0.5, _eff_min * 0.5)
+                _run = _best = 0
+                for _v in _env:
+                    _run = _run + 1 if _v >= _hi else 0
+                    if _run > _best:
+                        _best = _run
+                sustain_ms = _best * _win / SAMPLE_RATE * 1000.0
+            else:
+                top3 = seg_rms
+                sustain_ms = len(audio) / SAMPLE_RATE * 1000.0
+            # ★ 两个条件合成**一个**闸 ✓：漏一个就是"日志说跳过了、其实还喂给 ASR"✗
+            #   （我第一版把"持续过短"写成只打印不 continue ✗✓ 又是一条说谎的日志 ✗）
+            # ★ 判据与日志**同源** ✓：写死两处 ✗ 必然有一天不一致 ✓（我这条就写错成 250ms 了 ✗）
+            _SUSTAIN_MS = 150.0
+            if top3 < _eff_min or sustain_ms < _SUSTAIN_MS:
+                _why = (f"电平过低（top3={top3:.4f} < {_eff_min:.4f}"
+                        f"{'·播报期加倍 ✓' if _playback_active else ''}）" if top3 < _eff_min
+                        else f"持续过短（连续高能 {sustain_ms:.0f}ms < {_SUSTAIN_MS:.0f}ms：敲击/咔哒/电流声 ✗）")
+                print(f"[asr] {_why}跳过 → 不喂 ASR，避免它编出内容 ✗"
+                      f"（burst={burst:.4f} rms={seg_rms:.4f}）",
+                      file=sys.stderr, flush=True)
+                # ★ 被拒的段也要留证据 ✓：否则"我觉得我声音正常"永远没法核对 ✗
+                #   （原先只有喂给 ASR 的段才落盘 ✓ → 低电平段连机器听到的是啥都不知道 ✗）
+                #   文件名带 `_空.` ✓ → 走上面既有的"空结果先扔"淘汰规则 ✓ 不额外加淘汰代码 ✓
+                kept_url = None
+                if RECORD_ON:
+                    try:
+                        keep_dir = os.path.join(TMP_DIR, "asr_kept")
+                        os.makedirs(keep_dir, exist_ok=True)
+                        name = (f"{time.strftime('%H%M%S')}_r{seg_rms:.4f}_g0_d{duration:.2f}_低电平_空.wav")
+                        sf.write(os.path.join(keep_dir, name), audio, SAMPLE_RATE, subtype='PCM_16')
+                        kept_url = '/temp/asr_kept/' + name
+                    except Exception as ke:
+                        print(f"[asr] 低电平段留音频失败: {type(ke).__name__}: {ke}", file=sys.stderr, flush=True)
+                out({"type": "asr_result", "text": "", "duration": round(duration, 2),
+                     "rms": round(seg_rms, 4), "burst": round(burst, 4), "gain": 0, "asr_ms": 0,
+                     "vad_skip": True, "audio_url": kept_url})
+                continue
             boosted, gain = normalize_for_asr(audio)
-            text = transcribe(boosted)
+            # ★ webrtcvad 二道闸：拦住"能量够但没话说"的噪声碎片（用户实测：必须说很快、一停就只剩片段）
+            try:
+                ratio = voiced_ratio(audio)
+            except Exception:
+                ratio = 1.0
+            if ratio < VAD_WEBRTC_MIN:
+                print(f"[asr] webrtcvad 判定无人声（voiced={ratio:.2f} < {VAD_WEBRTC_MIN}）→ 跳过识别 ✓",
+                      file=sys.stderr, flush=True)
+                out({"type": "asr_result", "text": "", "duration": round(duration, 2),
+                     "rms": round(seg_rms, 4), "gain": 0, "asr_ms": 0, "vad_skip": True})
+                continue
+            text = transcribe(boosted, keep=RECORD_ON)
             asr_ms = int((time.time() - t_asr0) * 1000)
+            kept_url = None   # 本次留住的录音 URL ✓（开关关着 / 没留住就是 None ✓ 前端也就不画 ▶ ✓）
+            conf_score, conf_parts = utterance_conf(seg_rms, gain, duration, text)   # 「可信度」+ 分项原值 ✓
+            if RECORD_ON and _last_asr_wav and os.path.exists(_last_asr_wav):
+                # 文件名带上"模型听到的是什么条件"✓：电平 / 数字增益 / 时长 / 识别结果 ✓
+                # → 识别错时能直接回放听 ✓ 也能离线重喂做 A/B（增益、降噪、补静音 ✓）
+                try:
+                    keep_dir = os.path.join(TMP_DIR, "asr_kept")
+                    os.makedirs(keep_dir, exist_ok=True)
+                    _bad = '\\/:*?"<>| \t'
+                    safe = ''.join(ch for ch in text if ch not in _bad)[:12] or '空'
+                    dst = os.path.join(keep_dir, f"{time.strftime('%H%M%S')}_"
+                                                 f"r{seg_rms:.4f}_g{gain:.1f}_d{duration:.2f}_{safe}.wav")
+                    os.replace(_last_asr_wav, dst)
+                    kept_url = '/temp/asr_kept/' + os.path.basename(dst)   # 浏览器要的就是这个 URL ✓（express 把 temp/ 挂在 /temp 下 ✓）
+                    # ★ 不要在这里给 _last_asr_wav 赋值 ✗：asr_worker 里一旦有赋值语句 ✓
+                    #   Python 就把它当**局部变量** ✓ → 第 810 行先读 → UnboundLocalError ✓
+                    #   （transcribe() 每次都会重设它 ✓ 这里无需清 ✓）
+                    olds = sorted(os.listdir(keep_dir),
+                                  key=lambda f: os.path.getmtime(os.path.join(keep_dir, f)))   # 旧→新 ✓
+                    # ★ 溢出时的丢弃策略：**空结果的先扔** ✓（多是噪声/脉冲 ✓ 没有取证价值 ✗）
+                    #   带识别文本的尽量留 ✓（"听它到底把我念成什么了"就靠这些 ✓；实测 12 条上限
+                    #   会把刚录的 `跟我打电话` 挤掉 ✗ → 用户要听时文件已经没了 ✓）
+                    over = len(olds) - ASR_KEEP_MAX
+                    if over > 0:
+                        empty_ = [f for f in olds if '_空.' in f]
+                        victims = empty_[:over]
+                        if len(victims) < over:
+                            rest = [f for f in olds if f not in set(victims)]
+                            victims += rest[:over - len(victims)]
+                        for f in victims:
+                            try:
+                                os.remove(os.path.join(keep_dir, f))
+                            except OSError:
+                                pass
+                    print(f"[asr] 已留音频: {os.path.basename(dst)} → 目录内现存 {len(os.listdir(keep_dir))} 条 ✓"
+                          f"（temp/ 里未搬走的 asr_<uuid>.wav: "
+                          f"{len([f for f in os.listdir(TMP_DIR) if f.startswith('asr_') and not f.startswith('asr_empty_')])}）",
+                          file=sys.stderr, flush=True)
+                except Exception as ke:
+                    print(f"[asr] 留音频失败: {type(ke).__name__}: {ke}", file=sys.stderr, flush=True)
             if not text:
                 try:
                     global _empty_dump_idx
@@ -887,7 +991,8 @@ def asr_worker():
                           file=sys.stderr, flush=True)
             out({"type": "asr_result", "text": text,
                  "duration": round(duration, 2), "rms": round(seg_rms, 4), "gain": round(gain, 2),
-                 "asr_ms": asr_ms})
+                 "asr_ms": asr_ms, "audio_url": kept_url,
+                 "conf": conf_score, "conf_parts": conf_parts})
         except Exception as e:
             out({"type": "error", "error": str(e)})
 
@@ -915,6 +1020,39 @@ def handle_audio_frame(cmd):
         push_block(seg)
 
 
+_no_server_play_logged = False   # "服务端放音未启用"只提示一次
+_tts_epoch = 0          # 打断世代号：fast_interrupt 时 +1；合成完成的段落若世代变了就丢弃 ✗
+                        # ✗ 否则"正在合成中的那一句"会在打断后照样播放（实测打断后又响了 6 秒）
+
+
+def fast_interrupt(reason="clear"):
+    """立刻打断：停当前播放 + 丢弃排队中待合成的 tts 段 ✓
+    ✗ 关键：必须能在 stdin 线程里直接调用 —— 主循环此刻可能正卡在一整句合成（~1.5s），
+       clear 排在它后面会导致"喊停后还要念完当前这句"（实测延迟 4.9s ✗）"""
+    global _tts_epoch
+    _tts_epoch += 1
+    if _player is not None:
+        dropped = _player.stop()
+        if dropped:
+            print(f"[tts] 打断播放：丢弃 {dropped} 段（{reason}）", file=sys.stderr, flush=True)
+    kept = queue.Queue()
+    while True:
+        try:
+            item = _cmd_queue.get_nowait()
+        except queue.Empty:
+            break
+        if item is None or (isinstance(item, dict) and item.get("cmd") == "tts"):
+            if item is None:
+                kept.put(item)          # 哨兵要留着 ✓
+            continue
+        kept.put(item)
+    while True:
+        try:
+            _cmd_queue.put(kept.get_nowait())
+        except queue.Empty:
+            break
+
+
 def stdin_reader():
     for line in sys.stdin:
         line = line.strip()
@@ -927,6 +1065,12 @@ def stdin_reader():
             if isinstance(cmd, dict) and cmd.get("cmd") == "audio":
                 handle_audio_frame(cmd)
                 out({"type": "ack", "cmd": "audio"})   # 回执让服务端放行下一帧
+                continue
+            # ★ 打断类命令旁路队列：队列前面可能压着一整句合成（~1.5s），
+            #   走队列会让"喊停"延迟一整句 ✗（实测 4.9s）→ 在 stdin 线程里立即执行 ✓
+            if isinstance(cmd, dict) and cmd.get("cmd") == "clear":
+                fast_interrupt("stop-word/interrupt")
+                out({"type": "ack", "cmd": "clear"})
                 continue
             _cmd_queue.put(cmd)
     _cmd_queue.put(None)
@@ -979,7 +1123,7 @@ def level_sender():
 # ========== Main Loop ==========
 def main():
     global _listen_active, _playback_active, _playback_since, _playback_off_at, _feed_mode, _stream, _player, _aec
-    global TTS_BACKEND, TTS_ORDER
+    global TTS_BACKEND, TTS_ORDER, PLAY_SERVER
 
     if PLAY_SERVER:
         _player = Player(aec=_aec)
@@ -1011,8 +1155,11 @@ def main():
                         _stream = sd.InputStream(
                             samplerate=CAPTURE_RATE,          # ★ 原生率采集 ✗ 用 16k 会被驱动压低 10~15 倍
                             channels=CHANNELS,
+                            device=resolve_device(conf("asr.inputDevice") or None),   # 可用 asr.inputDevice 换麦克风 ✓
                             dtype=np.float32,
-                            blocksize=BLOCK_SIZE * DECIM,     # 保证抽取后正好是 80ms（下游块大小不变 ✓）
+                            blocksize=INPUT_BLOCK,            # ✗ 不能要 3840（80ms@48k）：MME 单次缓冲上限约 1024
+                                                              #   驱动给不满 → 大段空洞（实测包络"空→爆点→空"✗）
+                                                              # ✓ 改为 960 帧（20ms）小块采集，在回调里攒满 80ms 再下发
                             # ✗ 采集不要用 latency="low"：MME 上实测会丢块/断续 → ASR 全空（用户现场就是这症状）
                             callback=audio_callback,
                         )
@@ -1040,11 +1187,7 @@ def main():
                         _playback_off_at = time.time()
 
             elif action == "clear":
-                # 打断：停掉正在播的音 + 丢掉待播段（服务端放音时这是"立刻闭嘴"的关键）
-                if _player is not None:
-                    dropped = _player.stop()
-                    if dropped:
-                        print(f"[tts] 打断播放：丢弃 {dropped} 段", file=sys.stderr, flush=True)
+                fast_interrupt("clear(queued)")
                 # Interrupt: drop pending tts commands still queued for synthesis
                 kept = queue.Queue()
                 while True:
@@ -1066,7 +1209,17 @@ def main():
                 voice = cmd.get("voice", "zh-CN-XiaoxiaoNeural")
                 rid = cmd.get("id")
                 if text:
+                    epoch = _tts_epoch                    # ★ 记下世代
                     audio_path, backend = synthesize(text, voice)
+                    if epoch != _tts_epoch:
+                        # 合成期间被打断：这句已经不该出声了 ✗ → 丢弃，不播也不回报
+                        print(f"[tts] 该段合成期间被打断，丢弃（{text[:12]}…）", file=sys.stderr, flush=True)
+                        try:
+                            os.remove(audio_path)
+                        except OSError:
+                            pass
+                        out({"type": "ack", "cmd": "tts_dropped", "id": rid})
+                        continue
                     try:
                         duration = float(sf.info(audio_path).duration)
                     except Exception:
@@ -1079,6 +1232,14 @@ def main():
                         except Exception as pe:
                             print(f"[tts] 服务端放音入队失败，改由浏览器播放: {pe}",
                                   file=sys.stderr, flush=True)
+                    else:
+                        # ✗ 静默兜底是这轮的万恶之源：这里必须有日志（但只提示一次，避免每句刷屏）
+                        global _no_server_play_logged
+                        if not _no_server_play_logged:
+                            _no_server_play_logged = True
+                            print(f"[tts] 服务端放音未启用（PLAY_SERVER={PLAY_SERVER} "
+                                  f"_player={'有' if _player is not None else '无'} cfg={TTS_PLAYBACK}）"
+                                  f"→ 由浏览器播放 ✓ 后续不再重复提示", file=sys.stderr, flush=True)
                     # play_mode 交给浏览器判断是否也要放（auto 模式下远程浏览器要放 ✓ 本地不播 ✓）
                     out({"type": "tts_audio", "audio_path": audio_path, "text": text, "id": rid,
                          "backend": backend, "duration": round(duration, 2),
@@ -1096,6 +1257,30 @@ def main():
                     except Exception as e:
                         print(f"[prewarm] 失败: {e}", file=sys.stderr, flush=True)
 
+            elif action == "set_record":
+                # ★ 界面「🎙 录音留证」勾选框 ✓：实时开关 ✓ 不用重启 ✓（关了就不再往 temp/asr_kept/ 落盘 ✓）
+                global RECORD_ON   # ✗ 必须显式 global：本函数里一有赋值 ✓ Python 就把它当局部变量 → 别处读就 UnboundLocalError ✓
+                RECORD_ON = bool(cmd.get("on", False))
+                print(f"[asr] 调试录音 → {'开 ✓（每句存 temp/asr_kept/ ✓ 界面气泡可回放 ▶）' if RECORD_ON else '关 ✗（不再存盘 ✓）'}", file=sys.stderr, flush=True)
+                out({"type": "record_ack", "on": RECORD_ON})
+            elif action == "list_voices":
+                # ★ 微软 edge 音色的**实时**列表 ✓：音色会下架 ✗（实测 Xiaohan/Xiaomo/Xiaorui/Xiaoxuan
+                #   端点已无 ✓ → 选中就 NoAudioReceived ✗ → 白等两次重试再兜底 Piper ✗）
+                # 所以界面不能写死清单 ✓；拉取失败回空表 ✓（服务端沿用旧表 ✓ 界面不崩 ✓）
+                try:
+                    import asyncio as _aio
+                    import edge_tts as _et
+                    _vs = _aio.run(_et.list_voices())
+                    _items = sorted(
+                        [{"id": v["ShortName"], "gender": v.get("Gender", ""),
+                          "locale": v.get("Locale", "")}
+                         for v in _vs if str(v.get("Locale", "")).startswith("zh")],
+                        key=lambda x: x["id"])
+                    out({"type": "edge_voices", "voices": _items})
+                except Exception as e:
+                    print(f"[voices] edge 音色列表拉取失败: {type(e).__name__}: {e}",
+                          file=sys.stderr, flush=True)
+                    out({"type": "edge_voices", "voices": [], "error": str(e)})
             elif action == "aec_calibrate":
                 # 就地标定：用**生产中的**输出/采集流测播放→麦克风往返延迟，
                 # 按 ERLE 扫最佳 delay（跨进程标定会因流启动时序不同而失配，实测踩过）
@@ -1177,12 +1362,24 @@ def main():
                     except Exception as ce:
                         out({"type": "error", "error": f"标定失败: {ce}"})
 
+            elif action == "set_playback":
+                # ★ 放音端随采集端自动配对 ✓（✗ 混用时两边都没有回声参考信号 → 等于没有回声消除，用户实测过）
+                want = bool(cmd.get("server", True))
+                if want != PLAY_SERVER:
+                    PLAY_SERVER = want
+                    if want and _player is None:
+                        _player = Player(aec=_aec)
+                    print(f"[tts] 放音端切换 → {'服务端喇叭' if want else '浏览器'}"
+                          f"（与采集端配对 ✓）", file=sys.stderr, flush=True)
+                out({"type": "ack", "cmd": "set_playback"})
+
             elif action == "set_speed":
-                # 语速热调（web 设置面板）；Kokoro 侧车每句读一次 ✓
-                global KOKORO_SPEED
+                # 语速热调（web 设置面板）：Piper 每句传参 ✓
+                global TTS_SPEED
                 try:
-                    KOKORO_SPEED = max(0.5, min(2.0, float(cmd.get("speed", 1.0))))
-                    print(f"[tts] 语速热调 → {KOKORO_SPEED}", file=sys.stderr, flush=True)
+                    sp = max(0.5, min(2.0, float(cmd.get("speed", 1.0))))
+                    TTS_SPEED = sp
+                    print(f"[tts] 语速热调 → {sp}", file=sys.stderr, flush=True)
                 except (TypeError, ValueError):
                     pass
                 out({"type": "ack", "cmd": "set_speed"})
@@ -1190,7 +1387,7 @@ def main():
             elif action == "set_backend":
                 # 运行时热切换 TTS 后端（web 设置面板选音色时用）：不用重启 worker
                 b = str(cmd.get("backend", "")).strip().lower()
-                if b in ("piper", "kokoro", "sherpa", "edge") and b != TTS_BACKEND:
+                if b in ("piper", "edge") and b != TTS_BACKEND:
                     TTS_BACKEND = b
                     TTS_ORDER = _tts_order(b)
                     print(f"[tts] 后端热切换 → {b}（兜底顺序 {TTS_ORDER}）", file=sys.stderr, flush=True)
@@ -1208,13 +1405,6 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    finally:
-        if _kokoro_gpu is not None:
-            try:
-                _kokoro_gpu.stdin.write(json.dumps({"cmd": "quit"}) + "\n")
-                _kokoro_gpu.stdin.flush()
-                _kokoro_gpu.terminate()
-            except Exception:
-                pass
+    # 原先这里要收尾 Kokoro sidecar 子进程 ✗（Kokoro 已淘汰 → 那个全局也删了 ✓）
+    # 留着会 NameError ✗；现在无外部子进程需要清理 ✓
+    main()

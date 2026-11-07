@@ -18,6 +18,8 @@
 // 强句末标点（中文 + 英文 + 换行）
 const SENT_END = new Set(['。', '！', '？', '；', '!', '?', ';', '\n', '…']);
 // 弱停顿（仅用于超长句强制切分）
+// 方括号标记（工具结果/控制标记等）不该被念出来 ✗
+const BRACKET_MARK = /\[[^\]]{0,24}\]/g;
 const CLAUSE = ['，', '、', ',', '：', ':'];
 // 成对引号/括号（内部不断句）
 const QUOTE_OPEN = new Set(['「', '『', '“', '‘', '（', '(', '《', '【', '[', '{']);
@@ -27,12 +29,14 @@ const EMOJI_RE = /[\p{Extended_Pictographic}\uFE0F\u200D]/gu;
 const PUNCT_ONLY_RE = /^[\p{P}\p{S}]+$/u;
 const SPEAKABLE_RE = /[\p{Script=Han}\p{Letter}\p{Number}]/u;
 
-const DEFAULT_MAX = 48;
+const DEFAULT_MAX = 20;   // ✗ 原 48：28 字的回答整句才合成 → 第一声要等 LLM 全写完（实测体感很慢 ✓）
+                          // ✓ 20：按逗号/分句边流边合成，第一声提前 0.5~1 秒 ✓
 
 /** 去掉 Markdown / 符号 / emoji，留下可朗读文本。全空白/纯符号返回 '' */
 function ttsClean(text) {
   if (!text) return '';
   let s = text;
+  s = s.replace(BRACKET_MARK, ' ');            // ✗ [工具结果]/[stop] 这类方括号标记不该被念出来
   s = s.replace(EMOJI_RE, '');                        // emoji
   s = s.replace(/<[^>]{1,80}>/g, '');                 // HTML 标签
   s = s.replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1');     // 图片 → alt

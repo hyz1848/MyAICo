@@ -13,6 +13,14 @@
   let micStream = null, audioCtx = null, captureNode = null, captureSource = null;
   let audioQueue = [];
   let isPlayingAudio = false;
+  // 播放音量：压低一点可显著减少"自己说自己听"（不改任何能力 ✓ 只调电平 ✓）
+  // ★ 0.65 → 0.35 ✓（2026-10-19 晚）：外放越响，喇叭→麦克风的回声越大 ✗
+  //   实测证据 ✓：`playing=true` 期间识别出「对呀球子」「我说你过年啊」「好多啊」(rms 0.05~0.08 ✗)
+  //   = 它听见自己的声音 → 当成用户插话 → 自我对话 ✗✗（echo.tailMs 也加长到 2500 一起兜 ✓）
+  const PLAYBACK_VOLUME = 0.35;
+  // localStorage 在隐私模式/file:// 下会抛异常 ✗：顶层读一次就能让整页连不上 WS ✓（见 connect()）
+  const lsGet = (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } };
+  const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch (e) {} };
   let currentReplyId = 0;
   let playbackMode = 'server';   // server = Python 端放音（浏览器只显示）
   let streamEl = null;   // 本轮流式回复的气泡元素
@@ -89,13 +97,15 @@
         frameSamples = msg.frameSamples || 1280;
         wakeWord = msg.wakeWord || wakeWord;
         if (typeof msg.awake === 'boolean') wakeAwake = msg.awake;
+        // ★ 界面显示服务端的**真实**录音状态 ✓（不是本地记性 ✗）：hello.recordAudio ← conf debug.recordUserAudio ✓
+        if ($('optRecord') && typeof msg.recordAudio === 'boolean') $('optRecord').checked = msg.recordAudio;
         if ($('captureSource')) $('captureSource').value = captureMode;
         if (captureMode === 'browser') {
           updateInputHint('browser-mic');
         }
         // ✗ 服务重启后页面只会重连、不会重新发起聆听 → 表现为"我说了没反应"（麦克风实际没开）
         // ✓ 若刷新前是开启状态（localStorage 记住），重连后自动恢复聆听
-        if (!isListening && localStorage.getItem('voiceai_listening') === '1') {
+        if (!isListening && lsGet('voiceai_listening') === '1') {
           setTimeout(() => {
             if (!isListening && isConnected) {
               if (captureMode === 'browser') {
@@ -124,7 +134,7 @@
 
       case 'user_text':
         hideWelcome();
-        addMessage('user', msg.text);
+        addMessage('user', msg.text, false, { audio: msg.audio, conf: msg.conf, parts: msg.conf_parts });
         break;
 
       case 'llm_start':
@@ -137,12 +147,26 @@
       case 'stop_tts':
         currentReplyId = -1;   // 打断后，仍在途的同 id 音频一律丢弃
         document.body.classList.remove('server-speaking');
+        bargeHeld = false;
         stopPlayback();
+        break;
+
+      case 'hold_tts':
+        // ★ 用户刚开口：立刻暂停（不是清除 ✗）→ 判成噪声还能续播 ✓
+        bargeHeld = true;
+        if (currentAudio && !currentAudio.paused) { try { currentAudio.pause(); } catch (e) {} }
+        break;
+
+      case 'resume_tts':
+        // ★ ASR 判定不是有效插话 → 原地续播 ✓
+        bargeHeld = false;
+        if (currentAudio && currentAudio.paused) { try { currentAudio.play().catch(() => {}); } catch (e) {} }
+        else if (!currentAudio) playNext();
         break;
 
       case 'llm_stream':
         // 按 id 过滤：打断旧一轮时，旧流可能还有在途增量/收尾事件，不能污染新一轮气泡
-        if (msg.id !== undefined && currentReplyId && msg.id !== currentReplyId) break;
+        if (msg.id !== undefined && currentReplyId > 0 && msg.id !== currentReplyId) break;
         appendToStream(msg.content);
         break;
 
@@ -170,7 +194,7 @@
         break;
 
       case 'llm_retract': {
-        if (msg.id !== undefined && currentReplyId && msg.id !== currentReplyId) break;
+        if (msg.id !== undefined && currentReplyId > 0 && msg.id !== currentReplyId) break;
         // 撤回"调用工具前的草稿"：从当前气泡尾部删掉相应字数
         if (msg.chars > 0 && streamEl) {
           const bubble = streamEl.querySelector('.message-bubble');
@@ -203,7 +227,13 @@
         break;
 
       case 'tts_audio': {
-        if (msg.id !== undefined && currentReplyId && msg.id !== currentReplyId) break;
+        // 只按"数字回复 id"过滤 ✓；▶ 试听的 id 是字符串 "preview-<ts>" → 不能被这道过滤吃掉 ✗✓
+        // ★ -1（打断后）必须**一律丢数字 id** ✓：否则 stop_tts 之后在途/延迟 700ms 的旧音频
+        //   会照样播出来 → "界面都断了、播音还在响" ✗（真 bug ✓ 已实测）
+        if (msg.id !== undefined && typeof msg.id === 'number') {
+          if (currentReplyId === -1) break;
+          if (currentReplyId > 0 && msg.id !== currentReplyId) break;
+        }
         // 是否由浏览器放：server=否（Python 已在服务器喇叭放过 ✓）；
         // browser=是；both=两边都放；auto=服务器照常放 ✓ 且**远程**浏览器也要放 ✓
         // （本地浏览器不播 ✗ 否则和服务器喇叭同屋双响）
@@ -221,9 +251,19 @@
           noteServerPlayback(msg.text);
           break;
         }
-        playAudio(msg.audioPath || msg.audio_path, msg.text);
+        playAudio(msg.audioPath || msg.audio_path, msg.text, msg.visemes);
         break;
       }
+
+      case 'duix_poster':
+        // ★ 一进页面就显示真人 ✓（不依赖有没有说话 ✓）
+        try { window.DuixAvatar && window.DuixAvatar.onPoster(msg.url, msg.idle); } catch (e) {}
+        break;
+
+      case 'duix_clip':
+        // ★ 服务端把这段语音渲好了 ✓：转给播放器 ✓（它只在当前音频匹配时才切画面 ✓）
+        try { window.DuixAvatar && window.DuixAvatar.onClip(msg); } catch (e) {}
+        break;
 
       case 'asr_error':
       case 'error':
@@ -300,7 +340,22 @@
     if (welcomeMessage) welcomeMessage.style.display = 'none';
   }
 
-  function addMessage(role, text, withCursor = role === 'assistant') {
+  // 点击用户气泡回听自己那句原话 ✓：独立于 TTS 队列 ✓（不抢播放权、不上报 playback ✓
+  //   否则会把服务端的"正在放音"门控带偏 ✗ 连 VAD 阈值都跟着变 ✓）
+  let utteranceAudio = null;
+  function playUtterance(url, tag) {
+    if (!url) return;
+    if (utteranceAudio) { try { utteranceAudio.pause(); } catch (e) {} }
+    const a = new Audio(url);
+    utteranceAudio = a;
+    a.addEventListener('ended', () => { if (tag) tag.textContent = ' ▶'; });
+    a.addEventListener('error', () => { if (tag) tag.textContent = ' ✗已清理'; });
+    const label = tag ? tag.textContent : '';
+    a.play().then(() => { if (tag) tag.textContent = ' ⏸ 播放中'; })
+      .catch(() => { if (tag) { tag.textContent = ' ✗ 播不了'; setTimeout(() => { tag.textContent = label; }, 1800); } });
+  }
+
+  function addMessage(role, text, withCursor = role === 'assistant', opts = {}) {
     const msgEl = document.createElement('div');
     msgEl.className = `message ${role}`;
 
@@ -311,6 +366,29 @@
     const bubble = document.createElement('div');
     bubble.className = 'message-bubble';
     bubble.textContent = text;
+    // ★「可信度」✓：只在**调试勾选框开着**时显示 ✓（跟录音同一个开关 ✓）
+    //   paraformer **不给**模型置信度 ✗（实测四种入参只返回 key/text/timestamp ✓）
+    //   → 这是 rms/增益/时长/文本自洽 算出的**质量分** ✓ 悬停看原始数字 ✓ 不冒充模型后验 ✓
+    const dbgConf = $('optRecord') ? $('optRecord').checked : false;
+    if (dbgConf && typeof opts.conf === 'number') {
+      const c = document.createElement('span');
+      c.style.cssText = 'opacity:.62;font-size:.85em;margin-right:.4em';
+      const p = opts.parts || {};
+      c.textContent = ` 可信度 ${opts.conf}`;
+      c.title = `★不是模型后验 ✓（funasr 只返回 key/text/timestamp ✓）\n电平 rms=${p.rms} · 数字增益 ${p.gain}× · 时长 ${p.dur}s · 字数 ${p.chars}\n判据：认对的原始 rms 0.09~0.14 ✓ / 幻觉 0.009~0.030 且增益顶满 ✗`;
+      bubble.insertBefore(c, bubble.firstChild);   // 放在文字前面 ✓ 一眼看到 ✓
+    }
+    // ★ 用户气泡可点回放 ✓：服务端开着 debug.recordUserAudio 时会把这句录音的 URL 随 user_text 发来 ✓
+    //   识别错了不用再跑脚本、不用查日志 ✓ —— 点一下自己听 ✓（点击本身就是用户手势 ✓ 不会被自动播放策略拦 ✗）
+    if (opts.audio) {
+      const tag = document.createElement('span');
+      tag.textContent = ' ▶';
+      tag.title = '点这里回听这句（录音在 temp/asr_kept/ ✓ 只留最近若干条 ✗ 太旧的会提示已清理）';
+      bubble.appendChild(tag);
+      bubble.style.cursor = 'pointer';
+      bubble.dataset.audio = opts.audio;
+      bubble.addEventListener('click', () => playUtterance(bubble.dataset.audio, tag));
+    }
 
     if (withCursor) {
       const cursor = document.createElement('span');
@@ -385,8 +463,35 @@
     return {
       echo: $('optEcho') ? $('optEcho').checked : true,
       noise: $('optNoise') ? $('optNoise').checked : true,
-      agc: $('optAgc') ? $('optAgc').checked : true,
+      // ★ 自动增益默认**关** ✓：实测同一句"露露同学"的电平 20 秒内从 0.1375 掉到 0.0091 ✗（≈15 倍 ✓）
+      //   而 worker 侧数字增益顶到 maxGain=8 补不动 ✗ → 后半句被听成 `一`/`the`/空 ✓。
+      //   Chrome 的 AGC 自己压/抬增益 ✓ 与我们的确定性归一化（targetRms 0.1 ✓）叠加反而乱 ✗
+      //   → 交给 worker 一处管增益 ✓ 界面里仍可手动打开 ✓
+      agc: $('optAgc') ? $('optAgc').checked : false,
     };
+  }
+
+  // ★ 麦克风设备下拉 ✓：Chrome 的"默认麦"≠ 系统默认麦 ✗（实测抓到闲置的远场麦 → 只有环境音）
+  //   授权前 enumerateDevices 的 label 是空的 ✓ 所以 startBrowserCapture 成功后会再刷一次
+  async function refreshMicDevices() {
+    const sel = $('micDevice');
+    if (!sel || !navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+    try {
+      const devs = await navigator.mediaDevices.enumerateDevices();
+      const mics = devs.filter((d) => d.kind === 'audioinput');
+      const keep = sel.value || lsGet('voiceai_mic_device') || '';
+      sel.innerHTML = '';
+      const def = document.createElement('option');
+      def.value = ''; def.textContent = '系统默认';
+      sel.appendChild(def);
+      for (const m of mics) {
+        const o = document.createElement('option');
+        o.value = m.deviceId;
+        o.textContent = m.label || `麦克风 ${String(m.deviceId).slice(0, 6)}`;
+        sel.appendChild(o);
+      }
+      sel.value = mics.some((m) => m.deviceId === keep) ? keep : '';
+    } catch (e) {}
   }
 
   const PCM_WORKLET_SRC = `
@@ -419,17 +524,33 @@ registerProcessor('pcm-capture', PcmCapture);
 `;
 
   async function startBrowserCapture() {
+    // ★ 重入守卫 ✓：本函数会直接覆盖 micStream/audioCtx/captureNode ✗，
+    //   连点两下（服务端 vad_state 还没回来的窗口内 ✓）或重连自动聆听撞上手动点击 ✓
+    //   就会**双麦 + 两路 worklet 同时推 PCM → 帧率翻倍** ✓，且旧麦没 stop（麦克风指示灯常亮 ✗）
+    if (micStream || audioCtx || captureNode) stopBrowserCapture();
     // 这些处理开关在不同设备组合下效果差别很大：外放喇叭 + 普通麦时，
     // Chrome 的 AEC/降噪可能把人声也压掉（表现为"有声音但识别为空"），故做成可切换。
     const opts = getMicOptions();
-    micStream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: opts.echo,
-        noiseSuppression: opts.noise,
-        autoGainControl: opts.agc,
-        channelCount: 1,
-      },
-    });
+    const devId = $('micDevice') ? $('micDevice').value : (lsGet('voiceai_mic_device') || '');
+    const audioBase = {
+      echoCancellation: opts.echo,
+      noiseSuppression: opts.noise,
+      autoGainControl: opts.agc,
+      channelCount: 1,
+    };
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia(
+        devId ? { audio: { ...audioBase, deviceId: { exact: devId } } } : { audio: audioBase });
+    } catch (e) {
+      // 选中的麦拔了/不可用 → 退回系统默认 ✓ 并清掉记住的设备 ✓（别让"换电脑"变成"开不了麦"✗）
+      if (devId && (e.name === 'OverconstrainedError' || e.name === 'NotFoundError' || e.name === 'DevicesNotFoundError')) {
+        addNotice(`所选麦克风不可用（${e.name}）→ 已改用系统默认`);
+        lsSet('voiceai_mic_device', '');
+        if ($('micDevice')) $('micDevice').value = '';
+        micStream = await navigator.mediaDevices.getUserMedia({ audio: audioBase });
+      } else throw e;
+    }
+    refreshMicDevices();   // 拿到权限后才有真 label ✓ 此时刷新下拉才显示得全 ✓
     audioCtx = new AudioContext({ sampleRate: 16000 });
     if (audioCtx.state === 'suspended') await audioCtx.resume();
     const url = URL.createObjectURL(new Blob([PCM_WORKLET_SRC], { type: 'application/javascript' }));
@@ -448,6 +569,13 @@ registerProcessor('pcm-capture', PcmCapture);
     const track = micStream.getAudioTracks()[0];
     const s = track && track.getSettings ? track.getSettings() : {};
     console.log(`[capture] 浏览器采集启动: ${s.sampleRate || '?'}Hz echoCancellation=${s.echoCancellation}`);
+    // ★ 把麦克风"真实生效"的参数上报服务端 → 日志里能直接看到回声消除开没开（不再靠猜 ✗）
+    try {
+      if (isConnected) ws.send(JSON.stringify({ type: 'client_info', capture: {
+        echoCancellation: !!s.echoCancellation, noiseSuppression: !!s.noiseSuppression,
+        autoGainControl: !!s.autoGainControl, sampleRate: s.sampleRate || 0,
+        device: (micStream.getAudioTracks()[0] || {}).label || '?' } }));
+    } catch (e) {}
     addNotice(`浏览器麦克风已启用（回声消除 ${s.echoCancellation ? '开' : '关'}）`);
   }
 
@@ -463,6 +591,9 @@ registerProcessor('pcm-capture', PcmCapture);
   let playbackHeartbeat = null;
   let playbackToken = 0;
   let autoplayBlockedNotified = false;   // 自动播放被拦截只提示一次，避免每块都刷屏
+  // ★ 快速打断 ✓：服务端一报"开口"就先暂停本地播音（不等 ASR ✗）
+  //   ASR 确认是噪声 → resume_tts 原地续播 ✓；真插话 → stop_tts 彻底停 ✓
+  let bargeHeld = false;
 
   // 块间停顿：由句子结束标点决定（标点已随文本送给 TTS，语调由 edge-tts 决定）
   const PUNCT_GAP = { '。': 260, '．': 260, '.': 260, '！': 380, '!': 380, '？': 380, '?': 380, '；': 160, ';': 160, '…': 300, '\n': 300 };
@@ -478,8 +609,17 @@ registerProcessor('pcm-capture', PcmCapture);
     return DEFAULT_GAP;
   }
 
-  function playAudio(audioPath, text) {
-    audioQueue.push({ path: audioPath, text: text || '' });
+  function playAudio(audioPath, text, visemes) {
+    // visemes ✓：服务端算好的口型序列 ✓（见 viseme.js ✓ 权重 w 用来把音频时长分给各口型 ✓）
+    audioQueue.push({ path: audioPath, text: text || '', visemes: visemes || null });
+    // ★ 预解码 ✓：数字人得先 fetch + 解码才能开口 ✓ 若等 playNext 才做 ✓ 会有一段"没嘴"的静音 ✗
+    //   （用户实测「语音比嘴型早 0.5 秒」的两个成因之一 ✓ 另一个是静音时机 ✗ 见 avatar3d.js ✓）
+    try {
+      const av = window.VoiceAvatar && (window.VoiceAvatar.default || window.VoiceAvatar);
+      if (av && typeof av.prefetch === 'function') {
+        av.prefetch('/temp/' + String(audioPath || '').split(/[\\/]/).pop());
+      }
+    } catch (e) {}
     if (!isPlayingAudio) playNext();
   }
 
@@ -495,10 +635,13 @@ registerProcessor('pcm-capture', PcmCapture);
     }
     isPlayingAudio = false;
     if (playbackHeartbeat) { clearInterval(playbackHeartbeat); playbackHeartbeat = null; }
+    // ★ 数字人复位 ✓：不停的话它会按暂停时的 currentTime 一直画那帧 → 停在半张嘴 ✗
+    try { window.DuixAvatar && window.DuixAvatar.reset && window.DuixAvatar.reset(); } catch (e) {}
     if (isConnected) ws.send(JSON.stringify({ type: 'playback', on: false }));
   }
 
   function stopPlayback() {
+    bargeHeld = false;
     audioQueue = [];
     playbackToken++;
     if (currentAudio) {
@@ -509,10 +652,13 @@ registerProcessor('pcm-capture', PcmCapture);
     }
     isPlayingAudio = false;
     if (playbackHeartbeat) { clearInterval(playbackHeartbeat); playbackHeartbeat = null; }
+    // ★ 数字人复位 ✓：打断/停播后别停在半张嘴的帧 ✗（否则按暂停时的 currentTime 一直画那帧 ✗）
+    try { window.DuixAvatar && window.DuixAvatar.reset && window.DuixAvatar.reset(); } catch (e) {}
     if (isConnected) ws.send(JSON.stringify({ type: 'playback', on: false }));
   }
 
   function playNext() {
+    if (bargeHeld) return;   // ★ 暂停期间不推进队列 ✓（resume_tts 时会再调 ✓）
     if (audioQueue.length === 0) {
       isPlayingAudio = false;
       if (playbackHeartbeat) { clearInterval(playbackHeartbeat); playbackHeartbeat = null; }
@@ -528,11 +674,29 @@ registerProcessor('pcm-capture', PcmCapture);
     if (!playbackHeartbeat) {
       playbackHeartbeat = setInterval(() => {
         if (isConnected && isPlayingAudio) ws.send(JSON.stringify({ type: 'playback', on: true }));
-      }, 1000);
+      }, 600);   // 心跳 1000→600ms ✓：与服务端租约拉开倍数（见 server 的 lease ✓），后台标签页节流也顶得住 ✓
     }
     const token = playbackToken;
     const item = audioQueue.shift();
     currentAudio = new Audio(`/temp/${item.path.split(/[\\/]/).pop()}`);
+    // ★ 回声抑制（不改任何能力 ✓ 只调播放电平 ✓）：
+    //   外放音量越接近麦克风，Chrome 的 AEC 越难消掉 ✗ —— 实测回声会反过来触发"自己说自己听" ✗。
+    //   默认降到 0.65 ✓（技能/打断/停词全部保留 ✓）；觉得小声可以调 PLAYBACK_VOLUME ✓
+    currentAudio.volume = PLAYBACK_VOLUME;
+    // ★ 数字人 ✓：口型按**内容**驱动 ✓（visemes 是服务端逐字拼音算好的 ✓ 见 viseme.js ✓）
+    //   取用 window.VoiceAvatar ✓：avatar.js 是 ES 模块 ✓ 而本文件是传统脚本 ✗ 不能 import ✓
+    //   ★ 模块还没到时**不缓存 null** ✓：否则这一次会话就永远不出数字人了 ✗
+    //   ★ 出任何问题都只 warn ✓：语音链路一个字都不受影响 ✓（不降级 ✓）
+    try {
+      if (!window.DUIX_ONLY && !playNext.__avatar && window.VoiceAvatar) {
+        // 优先复用 avatar.js 在页面加载时建好的那个 ✓（否则同一容器会被建两次 ✗ 白跑一套 AudioWorklet ✗）
+        playNext.__avatar = window.VoiceAvatar.default
+          || window.VoiceAvatar.create({ container: document.getElementById('avatarDock') });
+      }
+      if (!window.DUIX_ONLY && playNext.__avatar) playNext.__avatar.speak(currentAudio, item.visemes);
+    } catch (e) { console.warn('[Avatar]', e && e.message); }
+    // ★ 2D 数字人（DUIX + Wav2Lip）✓：拿到这段的帧就切过去 ✓ 没有就先用上一段的画面 ✓
+    try { window.DuixAvatar && window.DuixAvatar.speak(currentAudio); } catch (e) {}
     const gap = gapFor(item.text);
     currentAudio.onended = () => {
       currentAudio = null;
@@ -584,7 +748,7 @@ registerProcessor('pcm-capture', PcmCapture);
 
   sendBtn.addEventListener('click', sendText);
   textInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') sendText();
+    if (e.key === 'Enter' && !e.isComposing) sendText();   // ✓ 中文输入法候选确认的 Enter 不再误发送 ✓
   });
 
   function sendText() {
@@ -596,6 +760,7 @@ registerProcessor('pcm-capture', PcmCapture);
 
   settingsBtn.addEventListener('click', () => {
     settingsPanel.classList.add('open');
+    try { window.__reloadDuixPicker && window.__reloadDuixPicker(); } catch (e) {}
   });
 
   const newSessionBtn = document.getElementById('newSessionBtn');
@@ -611,59 +776,186 @@ registerProcessor('pcm-capture', PcmCapture);
     if (e.target === settingsPanel) settingsPanel.classList.remove('open');
   });
 
-  // ===== 音色列表（Kokoro 100 个 + edge）+ 试听 =====
-  let voiceSamples = {};
-  const isKokoroVoice = (v) => /^(z[fm]|a[fm]|b[fm])_/i.test(v || '');
+  // ===== 音色列表（引擎 → 音色 两级）+ 试听 =====
+  let ttsEngines = {};        // { edge: {label, voices:[{id,label}]}, piper: {...} }
+  let currentEngine = 'edge';
   async function loadVoices() {
     try {
       const d = await (await fetch('/api/voices')).json();
-      voiceSamples = d.samples || {};
-      const sel = $('ttsVoice');
-      if (!sel) return;
-      const o = ['<optgroup label="Kokoro · 本地 · ' + (d.kokoro || []).length + ' 个音色">'];
-      for (const v of d.kokoro || []) {
-        o.push('<option value="' + v + '">' + v + (voiceSamples['kokoro:' + v] ? '' : '（无试听样本）') + '</option>');
+      ttsEngines = d.engines || {};
+
+      // ★ 大模型预设切换 ✓（多套热切换 ✓ 不用重启 ✓）
+      async function loadLLMPicker() {
+        const sel = $('llmPick');
+        if (!sel) return;
+        try {
+          const r = await (await fetch('/api/llm/presets')).json();
+          const list = r.presets || [];
+          sel.innerHTML = list.length
+            ? list.map((p) => '<option value="' + p.id + '">' + p.name + ' · ' + p.model + '</option>').join('')
+            : '<option value="">没有可用预设</option>';
+          if (r.active) sel.value = r.active;
+          sel.addEventListener('change', async () => {
+            const id = sel.value;
+            if (!id) return;
+            try {
+              const res = await fetch('/api/llm/switch', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id }),
+              });
+              const j = await res.json();
+              if (j && j.ok) {
+                const p = (j.presets || []).find((x) => x.id === j.active);
+                try { addNotice('大模型已切到 ' + (p ? p.name : j.active)); } catch (e) {}
+              }
+            } catch (e) { console.warn('[LLMPick] 切换失败', e && e.message); }
+          });
+        } catch (e) { console.warn('[LLMPick] 预设列表加载失败（不影响语音）:', e && e.message); }
       }
-      o.push('</optgroup><optgroup label="edge-tts · 微软 · 需联网">');
-      for (const v of d.edge || []) o.push('<option value="' + v + '">' + v + '</option>');
-      o.push('</optgroup>');
-      sel.innerHTML = o.join('');
-      let want = (d.current && d.current.voice) || '';
+      await loadLLMPicker();
+
+      // ★ 数字人形象下拉框 ✓：选完**即时换脸** ✓（重建实例 ✓ 不刷新页面 ✓ 不丢聊天记录 ✓）
+      //   ★ 整块包在 try 里 ✓：数字人出任何问题都绝不影响语音链路 ✓（不降级 ✓）
+      async function loadAvatarPicker() {
+        const sel = $('avatarPick');
+        if (!sel) return;
+        try {
+          const r = await (await fetch('/api/avatars')).json();
+          const list = r.avatars || [];
+          let cur = '';
+          try { cur = localStorage.getItem('voiceai.avatar') || ''; } catch (e) {}
+          sel.innerHTML = list.length
+            ? list.map((a) => '<option value="' + a.id + '">' + a.id + '（' + a.mb + ' MB）</option>').join('')
+            : '<option value="">目录里没有可用的 .glb</option>';
+          if (cur && list.some((a) => a.id === cur)) sel.value = cur;
+          sel.addEventListener('change', () => {
+            const id = sel.value;
+            if (!id) return;
+            try { localStorage.setItem('voiceai.avatar', id); } catch (e) {}
+            const VA = window.VoiceAvatar;
+            if (!VA || typeof VA.create !== 'function') return;
+            const dock = $('avatarDock');
+            try { if (VA.default && VA.default.destroy) VA.default.destroy(); } catch (e) {}
+            VA.default = VA.create({ container: dock, name: id });   // 重建 ✓ 新脸立刻加载 ✓
+          });
+        } catch (e) { console.warn('[AvatarPick] 形象列表加载失败（不影响语音）:', e && e.message); }
+      }
+      await loadAvatarPicker();
+
+      // ★ 2D 真人数字人（DUIX 素材包）✓ 切包 = 服务端换素材并重启渲染进程 ✓
+      async function loadDuixPicker() {
+        const sel = $('duixPick');
+        if (!sel) return;
+        try {
+          const r = await (await fetch('/api/duix/packs')).json();
+          if (!r.enabled) { sel.innerHTML = '<option value="">2D 数字人未启用</option>'; return; }
+          // ★ 2D 真人可用 → **彻底不用 3D** ✓（用户要求：数字人去掉，用真人）
+          window.DUIX_ONLY = true;
+          try {
+            const av = window.VoiceAvatar && window.VoiceAvatar.default;
+            if (av && av.destroy) av.destroy();          // 拆掉 3D（省一块 GPU ✓）
+            window.VoiceAvatar = null;
+            const row = sel.closest('.setting-item') && sel.closest('.setting-item').previousElementSibling;
+            const avPick = document.getElementById('avatarPick');
+            if (avPick && avPick.closest('.setting-item')) avPick.closest('.setting-item').style.display = 'none';
+          } catch (e) {}
+          const list = r.packs || [];
+          const cur = r.current || '';     // 只认服务端 ✓
+          const ids = list.map((p) => (typeof p === 'string' ? p : p.id));
+          sel.innerHTML = list.length
+            ? list.map((p) => { const id = typeof p === 'string' ? p : p.id; const nm = p.name || id;
+                                return '<option value="' + id + '">' + nm + '（' + id + '）</option>'; }).join('')
+            : '<option value="">没有素材包</option>';
+          if (ids.includes(cur)) sel.value = cur;
+          // ✗✗ 千万别在这里自动同步：设置面板每打开一次就重跑本函数 ✓
+          //   多个标签页各自存着不同的 localStorage → **互相把对方切回去** ✗
+          //   实测：两个窗口来回切、数字人狂闪 ✗
+          //   现在唯一真相是**服务端 conf.json** ✓ 前端只显示、只在用户主动选时发指令 ✓
+          // ★ 必须用 onchange 赋值 ✗ 不能用 addEventListener：设置面板每次打开都会重跑这个函数 ✓
+          //   addEventListener 会**叠加监听器** → 点一次换人等于连发 N 次 ✗
+          //   实测：渲染进程每 1.1s 重载一次素材包 → 数字人卡住 ✗
+          sel.onchange = () => {
+            const p = sel.value;
+            if (!p) return;
+            try { localStorage.setItem('voiceai.duix', p); } catch (e) {}
+            if (isConnected) ws.send(JSON.stringify({ type: 'duix_switch', pack: p }));
+          };
+        } catch (e) { console.warn('[DuixPick] 列表加载失败:', e && e.message); }
+      }
+      await loadDuixPicker();
+      // 设置面板每次打开都刷新一次列表 ✓ 新下好的素材包不用刷新页面就能出现 ✓
+      window.__reloadDuixPicker = loadDuixPicker;
+      const esel = $('ttsEngine');
+      const vsel = $('ttsVoice');
+      if (!vsel) return;
+      let want = (d.current && d.current.backend) || 'edge';
+      let wantVoice = (d.current && d.current.voice) || '';
       try {
         const s = JSON.parse(localStorage.getItem('voiceai_settings') || '{}');
-        if (s.voice) want = s.voice;
+        if (s.engine) want = s.engine;
+        if (s.voice) wantVoice = s.voice;
       } catch (e) {}
-      if (want) sel.value = want;
+      if (!ttsEngines[want]) want = Object.keys(ttsEngines)[0] || 'edge';
+      if (esel) {
+        esel.innerHTML = Object.keys(ttsEngines)
+          .map((k) => '<option value="' + k + '">' + (ttsEngines[k].label || k) + '</option>').join('');
+        esel.value = want;
+      }
+      currentEngine = want;
+      fillVoices(want, wantVoice);
     } catch (e) {
       addNotice('音色列表加载失败：' + (e.message || e));
     }
   }
+  function fillVoices(engine, pick) {
+    const vsel = $('ttsVoice');
+    const eng = ttsEngines[engine];
+    if (!vsel || !eng) return;
+    vsel.innerHTML = (eng.voices || [])
+      .map((v) => '<option value="' + v.id + '">' + (v.label || v.id) + '</option>').join('');
+    if (pick) vsel.value = pick;
+    // ★ 兜底 ✓：保存过的音色可能已被删除（例：aishell3 那 174 个"说话人"下线 ✗）
+    //   此时 vsel.value=pick 赋值失败 → value='' ✗ → 上行 {voice:''} 被服务端 `if (!v) break` 忽略 ✗
+    //   → 表现是"引擎切了音色没切 ✓、且 localStorage 存成空串 ✗"→ 回落到该引擎第一个音色 ✓
+    if (!vsel.value && eng.voices && eng.voices.length) vsel.value = eng.voices[0].id;
+  }
   loadVoices();
 
+  const engSel = $('ttsEngine');
+  if (engSel) engSel.addEventListener('change', () => {
+    currentEngine = engSel.value;
+    fillVoices(currentEngine);      // 换引擎 → 音色下拉换成该引擎的 ✓
+  });
+
+  // 试听：直接用当前音色合成一句（服务端走正常 TTS 通路 → 这里播放 ✓）
   const pvBtn = $('previewVoice');
-  if (pvBtn) pvBtn.addEventListener('click', () => {
-    const v = $('ttsVoice').value;
-    const url = voiceSamples[(isKokoroVoice(v) ? 'kokoro:' : 'edge:') + v];
-    if (!url) { addNotice('这个音色还没有试听样本（Kokoro 已预生成 100 个，edge 只有部分）'); return; }
-    if (window._pvAudio) { try { window._pvAudio.pause(); } catch (e) {} }
-    const a = new Audio(url);
-    window._pvAudio = a;
-    a.play().catch((err) => addNotice('试听播放失败：' + (err.message || err)));
+  if (pvBtn) pvBtn.addEventListener('click', async () => {
+    const voice = $('ttsVoice') ? $('ttsVoice').value : '';
+    const engine = $('ttsEngine') ? $('ttsEngine').value : currentEngine;
+    try {
+      if (isConnected) ws.send(JSON.stringify({ type: 'set_voice', voice, engine }));
+      await fetch('/api/preview');
+      addNotice('正在用「' + (ttsEngines[engine] ? (ttsEngines[engine].label || engine) : engine) + '」试听…');
+    } catch (e) {
+      addNotice('试听失败：' + (e.message || e));
+    }
   });
 
   $('saveSettings').addEventListener('click', () => {
     const voice = $('ttsVoice').value;
+    const engine = $('ttsEngine') ? $('ttsEngine').value : currentEngine;
     const opts = getMicOptions();
     const source = $('captureSource') ? $('captureSource').value : captureMode;
     const speed = $('ttsSpeed') ? Number($('ttsSpeed').value) : 1;
-    if (isConnected) ws.send(JSON.stringify({ type: 'set_voice', voice }));
+    if (isConnected) ws.send(JSON.stringify({ type: 'set_voice', voice, engine }));
     if (isConnected && speed) ws.send(JSON.stringify({ type: 'set_speed', speed }));   // 语速热调 ✓（不用重启）
-    localStorage.setItem('voiceai_settings', JSON.stringify({ voice, speed, ...opts, source }));
+    localStorage.setItem('voiceai_settings', JSON.stringify({ voice, engine, speed, ...opts, source }));
     settingsPanel.classList.remove('open');
 
     const wasListening = isListening;
     const sourceChanged = source !== captureMode;
     captureMode = source;
+    captureModeOverride = source;   // ✓ 一并更新：否则重连时 hello 里 `captureMode = captureModeOverride || msg.capture` 会静默回滚到旧选择 ✗✓
     // 采集参数改变需要重建采集链路，否则新设置不生效
     if (wasListening) {
       stopBrowserCapture();
@@ -686,7 +978,11 @@ registerProcessor('pcm-capture', PcmCapture);
   if (saved) {
     try {
       const s = JSON.parse(saved);
-      if (s.voice) $('ttsVoice').value = s.voice;
+      if (s.engine && $('ttsEngine')) {
+        currentEngine = s.engine;
+        $('ttsEngine').value = s.engine;
+        fillVoices(s.engine, s.voice);     // 引擎+音色一起恢复 ✓
+      } else if (s.voice) $('ttsVoice').value = s.voice;
       if (s.speed && $('ttsSpeed')) { $('ttsSpeed').value = String(s.speed); }
       if (typeof s.echo === 'boolean' && $('optEcho')) $('optEcho').checked = s.echo;
       if (typeof s.noise === 'boolean' && $('optNoise')) $('optNoise').checked = s.noise;
@@ -700,5 +996,26 @@ registerProcessor('pcm-capture', PcmCapture);
   }
 
   // ========== Init ==========
+  // ========== 调试录音热开关 ✓（界面勾选框 ↔ worker ✓ 改一下即时生效 ✗ 不用重启）==========
+  // 上行 {type:'record_audio',on} ✓ → 服务端转 worker {cmd:'set_record'} ✓（worker 回 record_ack ✓）
+  // 初值由 hello 填 ✓ → 界面永远显示服务端真实状态 ✓（不是浏览器自己的记性 ✗）
+  const optRecord = $('optRecord');
+  if (optRecord) optRecord.addEventListener('change', () => {
+    if (isConnected && ws) ws.send(JSON.stringify({ type: 'record_audio', on: optRecord.checked }));
+  });
+  // 麦克风设备：进页先刷一次（授权前 label 可能为空 ✓ 无妨）；插拔热刷新 ✓
+  refreshMicDevices();
+  const micSel = $('micDevice');
+  if (micSel) micSel.addEventListener('change', async () => {
+    lsSet('voiceai_mic_device', micSel.value);
+    if (micStream) {
+      stopBrowserCapture();
+      if (isConnected && isListening) {
+        try { await startBrowserCapture(); } catch (e) { addNotice(`切换麦克风失败: ${e.message || e}`); }
+      }
+    }
+  });
+  if (navigator.mediaDevices && navigator.mediaDevices.addEventListener)
+    { try { navigator.mediaDevices.addEventListener('devicechange', refreshMicDevices); } catch (e) {} }
   connect();
 })();
